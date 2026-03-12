@@ -172,6 +172,7 @@ Most Overleaf scripts stop at "upload files". This one does not.
 - `repo push-github` and `repo pull-github` only run on the configured default branch and require a clean working tree.
 - `repo push-overleaf` also stays on the configured default branch, but it syncs the current working tree and allows uncommitted changes.
 - `repo pull-overleaf` requires a clean working tree before applying remote changes locally.
+- If Overleaf stalls while generating the project zip, `repo push-overleaf` falls back to the remote file tree so local-only pushes still complete.
 
 That difference is intentional:
 

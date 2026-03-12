@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
+import requests as reqs
 from click.testing import CliRunner
 
 from overleaf_sync import cli
@@ -102,6 +103,14 @@ class BridgeHelpersTest(unittest.TestCase):
             self.assertEqual(loaded.project_name, "Bridge Demo")
             self.assertEqual(loaded.store_path, ".olauth")
             self.assertEqual(loaded.default_branch, "main")
+
+    def test_download_zip_wraps_request_timeout(self) -> None:
+        session = cli.OverleafSession({"cookie": {}, "csrf": "token"})
+        with mock.patch.object(session.session, "request", side_effect=reqs.Timeout("zip timeout")) as request:
+            with self.assertRaises(cli.RemoteZipDownloadError):
+                session.download_zip("project-1")
+
+        self.assertEqual(request.call_args.kwargs["timeout"], cli.DOWNLOAD_ZIP_TIMEOUT)
 
 
 class BridgeCommandsTest(unittest.TestCase):
@@ -292,6 +301,46 @@ class BridgeCommandsTest(unittest.TestCase):
     def test_bridge_alias_still_works(self) -> None:
         result = self.runner.invoke(cli.main, ["bridge", "--help"])
         self.assertEqual(result.exit_code, 0, result.output)
+
+
+class SyncFallbackTest(unittest.TestCase):
+    def test_sync_project_falls_back_for_local_only_push(self) -> None:
+        session = mock.Mock()
+        project = {"id": "project-1"}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sync_root = Path(tmpdir)
+            olignore_path = sync_root / ".olignore"
+            olignore_path.write_text("", encoding="utf-8")
+
+            with mock.patch.object(
+                cli,
+                "collect_sync_state",
+                side_effect=cli.RemoteZipDownloadError("zip export stalled"),
+            ), mock.patch.object(cli, "sync_project_local_only_fallback") as fallback:
+                cli.sync_project(session, project, sync_root, olignore_path, local_only=True, remote_only=False)
+
+        fallback.assert_called_once()
+        self.assertIs(fallback.call_args.args[0], session)
+        self.assertEqual(fallback.call_args.args[1], project)
+        self.assertEqual(fallback.call_args.args[2], sync_root)
+        self.assertEqual(fallback.call_args.args[3], olignore_path)
+        self.assertIsInstance(fallback.call_args.args[4], cli.RemoteZipDownloadError)
+
+    def test_sync_project_propagates_zip_failure_for_non_local_sync(self) -> None:
+        session = mock.Mock()
+        project = {"id": "project-1"}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sync_root = Path(tmpdir)
+            olignore_path = sync_root / ".olignore"
+            olignore_path.write_text("", encoding="utf-8")
+
+            with mock.patch.object(
+                cli,
+                "collect_sync_state",
+                side_effect=cli.RemoteZipDownloadError("zip export stalled"),
+            ):
+                with self.assertRaises(cli.RemoteZipDownloadError):
+                    cli.sync_project(session, project, sync_root, olignore_path, local_only=False, remote_only=True)
 
 
 if __name__ == "__main__":

@@ -40,6 +40,8 @@ BRIDGE_CONFIG_VERSION = 1
 DEFAULT_GIT_REMOTE = "origin"
 DEFAULT_STORE_PATH = ".overleaf-sync-auth"
 DEFAULT_OLIGNORE = ".olignore"
+DEFAULT_REQUEST_TIMEOUT = (10, 30)
+DOWNLOAD_ZIP_TIMEOUT = (10, 60)
 LOCAL_BRIDGE_METADATA_FILES = {
     BRIDGE_CONFIG_NAME,
     DEFAULT_STORE_PATH,
@@ -178,6 +180,10 @@ class GitStatusSummary:
     is_clean: bool
     ahead: int
     behind: int
+
+
+class RemoteZipDownloadError(click.ClickException):
+    """Raised when Overleaf's project archive cannot be downloaded reliably."""
 
 
 def load_store(cookie_path: str) -> dict:
@@ -615,11 +621,11 @@ class RealtimeProjectClient:
         if not hasattr(websocket, "SSLError"):
             websocket.SSLError = ssl.SSLError
 
-        handshake = self.session.session.get(
+        handshake = self.session._request(
+            "get",
             f"{BASE_URL}/socket.io/1/",
             params={"projectId": self.project_id, "esh": 1, "ssp": 1, "t": int(time.time())},
         )
-        handshake.raise_for_status()
         if "GCLB" in handshake.cookies:
             self.session.session.cookies.set("GCLB", handshake.cookies["GCLB"])
 
@@ -718,6 +724,14 @@ class OverleafSession:
     def persist(self, cookie_path: str) -> None:
         save_store(cookie_path, self.session.cookies.get_dict(), self.csrf)
 
+    def _request(self, method: str, url: str, *, timeout=DEFAULT_REQUEST_TIMEOUT, **kwargs):
+        response = self.session.request(method, url, timeout=timeout, **kwargs)
+        response.raise_for_status()
+        content_type = response.headers.get("content-type", "")
+        if "text/html" in content_type:
+            self._update_csrf(response.text)
+        return response
+
     def _cookie_values(self, name: str) -> list[str]:
         values = []
         for cookie in self.session.cookies:
@@ -732,9 +746,7 @@ class OverleafSession:
             self.csrf = token.get("content", self.csrf)
 
     def _projects_page(self) -> str:
-        response = self.session.get(PROJECTS_URL)
-        response.raise_for_status()
-        self._update_csrf(response.text)
+        response = self._request("get", PROJECTS_URL)
         return response.text
 
     def _parse_projects(self, html: str) -> list[dict]:
@@ -769,17 +781,23 @@ class OverleafSession:
         raise click.ClickException(f"Overleaf project '{project_name}' not found.")
 
     def download_zip(self, project_id: str) -> bytes:
-        response = self.session.get(DOWNLOAD_ZIP_URL.format(project_id=project_id))
-        response.raise_for_status()
+        try:
+            response = self._request("get", DOWNLOAD_ZIP_URL.format(project_id=project_id), timeout=DOWNLOAD_ZIP_TIMEOUT)
+        except reqs.RequestException as exc:
+            raise RemoteZipDownloadError(
+                "Failed to download the Overleaf project archive. "
+                "Retry the command, or use a local-only push (`ovs -l` / `ovs repo push-overleaf`) "
+                "which can fall back to the remote file tree."
+            ) from exc
         return response.content
 
     def create_folder(self, project_id: str, parent_folder_id: str, folder_name: str) -> dict:
-        response = self.session.post(
+        response = self._request(
+            "post",
             CREATE_FOLDER_URL.format(project_id=project_id),
             headers={"X-Csrf-Token": self.csrf},
             json={"parent_folder_id": parent_folder_id, "name": folder_name},
         )
-        response.raise_for_status()
         return response.json()
 
     def delete_entity(self, project_id: str, entity: dict) -> None:
@@ -792,13 +810,13 @@ class OverleafSession:
         else:
             raise click.ClickException(f"Unsupported Overleaf entity kind '{entity['kind']}'.")
 
-        response = self.session.delete(url, headers={"X-Csrf-Token": self.csrf}, json={})
-        response.raise_for_status()
+        self._request("delete", url, headers={"X-Csrf-Token": self.csrf}, json={})
 
     def upload_file(self, project_id: str, folder_id: str, local_path: Path) -> dict:
         mime_type = mimetypes.guess_type(local_path.name)[0] or "application/octet-stream"
         with local_path.open("rb") as handle:
-            response = self.session.post(
+            response = self._request(
+                "post",
                 f"{UPLOAD_URL.format(project_id=project_id)}?folder_id={folder_id}",
                 headers={"X-Csrf-Token": self.csrf},
                 files={
@@ -808,7 +826,6 @@ class OverleafSession:
                     "qqfile": (local_path.name, handle, mime_type),
                 },
             )
-        response.raise_for_status()
         payload = response.json()
         if not payload.get("success"):
             raise click.ClickException(f"Failed to upload '{local_path.name}' to Overleaf: {payload}")
@@ -831,7 +848,8 @@ class OverleafSession:
     ) -> dict:
         payload = {}
         for attempt in range(max_attempts):
-            response = self.session.post(
+            response = self._request(
+                "post",
                 COMPILE_URL.format(project_id=project_id),
                 headers={"X-Csrf-Token": self.csrf},
                 json={
@@ -842,7 +860,6 @@ class OverleafSession:
                     "stopOnFirstError": stop_on_first_error,
                 },
             )
-            response.raise_for_status()
             payload = response.json()
 
             status = payload.get("status")
@@ -862,13 +879,15 @@ class OverleafSession:
         else:
             url = f"{BASE_URL}/{output_url.lstrip('/')}"
 
-        response = self.session.get(url, headers={"X-Csrf-Token": self.csrf})
-        response.raise_for_status()
+        response = self._request("get", url, headers={"X-Csrf-Token": self.csrf})
         return response.content
 
     def extract_tree(self, project_id: str) -> tuple[dict[str, dict], dict[str, dict], str]:
-        socket_response = self.session.get(f"{BASE_URL}/socket.io/1/", params={"projectId": project_id, "esh": 1, "ssp": 1, "t": 1})
-        socket_response.raise_for_status()
+        socket_response = self._request(
+            "get",
+            f"{BASE_URL}/socket.io/1/",
+            params={"projectId": project_id, "esh": 1, "ssp": 1, "t": 1},
+        )
         if "GCLB" in socket_response.cookies:
             self.session.cookies.set("GCLB", socket_response.cookies["GCLB"])
 
@@ -985,6 +1004,21 @@ def collect_sync_state(session: OverleafSession, project: dict, sync_path: Path,
         "remote_folders": remote_folders,
         "remote_entities": remote_entities,
         "root_folder_id": root_folder_id,
+        "remote_zip_available": True,
+    }
+
+
+def collect_tree_sync_state(session: OverleafSession, project: dict, sync_path: Path, olignore_path: Path) -> dict:
+    patterns = ignore_patterns(olignore_path)
+    local_files = collect_local_files(sync_path, patterns)
+    remote_folders, remote_entities, root_folder_id = session.extract_tree(project["id"])
+    return {
+        "local_files": local_files,
+        "remote_zip": {},
+        "remote_folders": remote_folders,
+        "remote_entities": remote_entities,
+        "root_folder_id": root_folder_id,
+        "remote_zip_available": False,
     }
 
 
@@ -1223,8 +1257,73 @@ def select_output_files(payload: dict, artifact_paths: tuple[str, ...], download
     return selected
 
 
+def sync_project_local_only_fallback(session: OverleafSession, project: dict, sync_path: Path, olignore_path: Path, error: Exception) -> None:
+    click.echo(f"[WARN] {error}")
+    click.echo("[WARN] Falling back to metadata-only local push; matching remote files will be refreshed from local content.")
+
+    state = collect_tree_sync_state(session, project, sync_path, olignore_path)
+    local_files = state["local_files"]
+    remote_folders = state["remote_folders"]
+    remote_entities = state["remote_entities"]
+    root_folder_id = state["root_folder_id"]
+    desired_folders = collect_folder_paths(local_files)
+
+    for path in sorted(remote_entities):
+        if path in local_files:
+            continue
+        entity = remote_entities[path]
+        session.delete_entity(project["id"], entity)
+        click.echo(f"[REMOTE DELETE] {path}")
+
+    realtime = None
+    try:
+        for path in sorted(local_files):
+            local_path = local_files[path]
+            existing = remote_entities.get(path)
+
+            if existing is not None and existing["kind"] == "doc":
+                if realtime is None:
+                    realtime = RealtimeProjectClient(session, project["id"])
+                try:
+                    updated = realtime.update_doc(existing["id"], read_local_text(local_path))
+                    if updated:
+                        click.echo(f"[LOCAL -> REMOTE OT] {path}")
+                    continue
+                except (UnicodeDecodeError, click.ClickException) as exc:
+                    click.echo(f"[OT FALLBACK] {path}: {exc}")
+
+            folder_path = posixpath.dirname(path)
+            folder_id = ensure_remote_folder(session, project["id"], remote_folders, root_folder_id, folder_path)
+            if existing is not None:
+                session.delete_entity(project["id"], existing)
+            payload = session.upload_file(project["id"], folder_id, local_path)
+            remote_entities[path] = {
+                "kind": "doc" if payload.get("entity_type") == "doc" else "file",
+                "id": payload["entity_id"],
+                "path": path,
+                "parent_folder_id": folder_id,
+                "name": local_path.name,
+            }
+            click.echo(f"[LOCAL -> REMOTE] {path}")
+    finally:
+        if realtime is not None:
+            realtime.close()
+
+    for folder_path in sorted(remote_folders, key=lambda item: item.count("/"), reverse=True):
+        if folder_path in desired_folders:
+            continue
+        session.delete_entity(project["id"], remote_folders[folder_path])
+        click.echo(f"[REMOTE DELETE FOLDER] {folder_path}")
+
+
 def sync_project(session: OverleafSession, project: dict, sync_path: Path, olignore_path: Path, local_only: bool, remote_only: bool) -> None:
-    state = collect_sync_state(session, project, sync_path, olignore_path)
+    try:
+        state = collect_sync_state(session, project, sync_path, olignore_path)
+    except RemoteZipDownloadError as exc:
+        if local_only and not remote_only:
+            sync_project_local_only_fallback(session, project, sync_path, olignore_path, exc)
+            return
+        raise
     local_files = state["local_files"]
     remote_zip = state["remote_zip"]
     remote_folders = state["remote_folders"]

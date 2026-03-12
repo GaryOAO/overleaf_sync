@@ -207,6 +207,7 @@ Most Overleaf scripts stop at "upload files". This one does not.
 - `push` can then reject stale stages when the Overleaf side changed after `ovs add`, instead of silently overwriting newer remote edits.
 - `pull` refuses to overwrite a folder that still has staged Overleaf updates pending.
 - `bind` and `repo init` capture a hidden remote merge base in `.ovs-base`, and `pull` uses that base for git-like three-way text merges.
+- rebinding resets local Overleaf state and merge-base metadata before re-initialization, so a failed rebind does not keep stale history from a different project.
 - unresolved pull conflicts are recorded locally and must be closed with `ovs resolve --ours`, `--theirs`, or `--mark-resolved`
 - GitHub operations use your existing local Git repository, its configured `origin`, and your local Git credentials.
 - Overleaf operations still use the auth store plus the current sync engine.
@@ -217,6 +218,7 @@ Most Overleaf scripts stop at "upload files". This one does not.
 - local-only and remote-only syncs warn before deleting files on the target side.
 - large uploads are called out before transfer, and sync steps are shown as numbered progress output.
 - If Overleaf stalls while generating the project zip, `repo push-overleaf` falls back to the remote file tree so local-only pushes still complete.
+- `ovs status -l`, `ovs --dry-run -l`, and `ovs repo status` degrade to a metadata-only push preview when the remote archive is temporarily unavailable.
 
 That difference is intentional:
 

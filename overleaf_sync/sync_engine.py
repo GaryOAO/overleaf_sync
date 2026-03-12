@@ -416,6 +416,36 @@ def build_sync_plan(
     return plan
 
 
+def build_metadata_only_local_push_plan(
+    local_files: dict[str, Path],
+    remote_entities: dict[str, dict],
+    remote_folders: dict[str, dict],
+) -> dict[str, list[str]]:
+    plan = {
+        "push_new": [],
+        "push_replace": [],
+        "pull_new": [],
+        "pull_replace": [],
+        "local_delete": [],
+        "remote_delete": [],
+        "remote_delete_folders": [],
+        "conflicts": [],
+    }
+    desired_folders = collect_folder_paths(local_files)
+    for rel_path in sorted(local_files):
+        if rel_path in remote_entities:
+            plan["push_replace"].append(rel_path)
+        else:
+            plan["push_new"].append(rel_path)
+    for rel_path in sorted(remote_entities):
+        if rel_path not in local_files:
+            plan["remote_delete"].append(rel_path)
+    for folder_path in sorted(remote_folders, key=lambda item: item.count("/"), reverse=True):
+        if folder_path not in desired_folders:
+            plan["remote_delete_folders"].append(folder_path)
+    return plan
+
+
 def print_sync_plan(plan: dict[str, list[str]]) -> None:
     labels = [
         ("push_new", "[PLAN LOCAL -> REMOTE NEW]"),
@@ -650,6 +680,7 @@ def push_staged_entries(
     stage_entries: dict[str, dict[str, str | None]],
     *,
     realtime_factory: Callable[[Any, str], Any],
+    on_applied: Callable[[str], None] | None = None,
 ) -> list[str]:
     state = collect_sync_state(session, project, sync_root, ovsignore_path)
     local_files = state["local_files"]
@@ -690,11 +721,15 @@ def push_staged_entries(
         for action, rel_path, local_path, remote_entity in actions:
             if action == "noop":
                 pushed.append(rel_path)
+                if on_applied is not None:
+                    on_applied(rel_path)
                 continue
             if action == "delete":
                 session.delete_entity(project["id"], remote_entity)
                 click.echo(f"{progress_prefix(progress, 'REMOTE DELETE')} {rel_path}")
                 pushed.append(rel_path)
+                if on_applied is not None:
+                    on_applied(rel_path)
                 continue
 
             assert local_path is not None
@@ -707,6 +742,8 @@ def push_staged_entries(
                     if updated:
                         click.echo(f"{progress_prefix(progress, 'LOCAL -> REMOTE OT')} {rel_path}")
                         pushed.append(rel_path)
+                        if on_applied is not None:
+                            on_applied(rel_path)
                         continue
                 except (UnicodeDecodeError, click.ClickException) as exc:
                     click.echo(f"[OT FALLBACK] {rel_path}: {exc}")
@@ -725,6 +762,8 @@ def push_staged_entries(
             }
             click.echo(f"{progress_prefix(progress, 'LOCAL -> REMOTE')} {rel_path}")
             pushed.append(rel_path)
+            if on_applied is not None:
+                on_applied(rel_path)
     finally:
         if realtime is not None:
             realtime.close()

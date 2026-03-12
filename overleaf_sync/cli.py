@@ -63,10 +63,12 @@ from overleaf_sync.local_state import (
 )
 from overleaf_sync.sync_engine import (
     RemoteZipDownloadError,
+    build_metadata_only_local_push_plan,
     build_destructive_sync_warnings,
     build_sync_plan,
     build_text_components,
     collect_sync_state,
+    collect_tree_sync_state,
     ensure_local_dir,
     format_sync_plan_summary,
     ignore_patterns,
@@ -325,8 +327,15 @@ def bridge_ignored_untracked_paths(repo_root: Path, config: BridgeConfig) -> set
         BASE_SNAPSHOT_DIR,
         CONFLICT_STATE_FILE,
         CONFLICT_SNAPSHOT_DIR,
-        DEFAULT_OLIGNORE,
     }
+    olignore_path = Path(config.olignore)
+    if olignore_path.is_absolute():
+        try:
+            ignored.add(olignore_path.resolve().relative_to(repo_root).as_posix())
+        except ValueError:
+            pass
+    else:
+        ignored.add(olignore_path.as_posix())
     store_path = Path(config.store_path).expanduser()
     if store_path.is_absolute():
         try:
@@ -796,11 +805,51 @@ class OverleafSession:
         return flatten_tree(tree_data)
 
 
+def collect_local_push_preview_state(
+    session: OverleafSession,
+    project: dict,
+    sync_root: Path,
+    olignore_path: Path,
+) -> tuple[dict, bool]:
+    try:
+        return collect_sync_state(session, project, sync_root, olignore_path), False
+    except RemoteZipDownloadError as exc:
+        click.echo(f"[WARN] {exc}")
+        click.echo(
+            "[WARN] Falling back to a metadata-only local push preview; "
+            "exact replace/no-op detection is unavailable until the remote archive is reachable."
+        )
+        return collect_tree_sync_state(session, project, sync_root, olignore_path), True
+
+
+def build_local_push_preview_plan(
+    session: OverleafSession,
+    project: dict,
+    sync_root: Path,
+    olignore_path: Path,
+) -> dict[str, list[str]]:
+    state, used_fallback = collect_local_push_preview_state(session, project, sync_root, olignore_path)
+    if used_fallback:
+        return build_metadata_only_local_push_plan(
+            state["local_files"],
+            state["remote_entities"],
+            state["remote_folders"],
+        )
+    return build_sync_plan(
+        state["local_files"],
+        state["remote_zip"],
+        state["remote_entities"],
+        state["remote_folders"],
+        True,
+        False,
+    )
+
+
 def print_bridge_status(
     git_status: GitStatusSummary,
     config: BridgeConfig,
     push_plan: dict[str, list[str]],
-    pull_plan: dict[str, list[str]],
+    pull_plan: dict[str, list[str]] | None,
     sync_root: Path,
 ) -> None:
     click.echo("Git:")
@@ -822,7 +871,10 @@ def print_bridge_status(
     click.echo(f"  project: {config.project_name}")
     click.echo(f"  sync_path: {sync_root}")
     click.echo(f"  push-overleaf: {format_sync_plan_summary(push_plan)}")
-    click.echo(f"  pull-overleaf: {format_sync_plan_summary(pull_plan)}")
+    if pull_plan is None:
+        click.echo("  pull-overleaf: unavailable (remote archive unavailable)")
+    else:
+        click.echo(f"  pull-overleaf: {format_sync_plan_summary(pull_plan)}")
 
 
 def build_display_tree(remote_folders: dict[str, dict], remote_entities: dict[str, dict]) -> dict:
@@ -1012,15 +1064,18 @@ def main(ctx: click.Context, local_only: bool, remote_only: bool, dry_run: bool,
     session = OverleafSession(load_store(str(store_path)))
     project = session.get_project(resolved_project_name)
     if dry_run:
-        state = collect_sync_state(session, project, sync_root, resolved_olignore_path)
-        plan = build_sync_plan(
-            state["local_files"],
-            state["remote_zip"],
-            state["remote_entities"],
-            state["remote_folders"],
-            local_only,
-            remote_only,
-        )
+        if local_only and not remote_only:
+            plan = build_local_push_preview_plan(session, project, sync_root, resolved_olignore_path)
+        else:
+            state = collect_sync_state(session, project, sync_root, resolved_olignore_path)
+            plan = build_sync_plan(
+                state["local_files"],
+                state["remote_zip"],
+                state["remote_entities"],
+                state["remote_folders"],
+                local_only,
+                remote_only,
+            )
         print_sync_plan(plan)
         session.persist(str(store_path))
         return
@@ -1085,11 +1140,12 @@ def bind(project_name: str, store_path: str | None, sync_path: str, olignore_pat
     write_bridge_config(bind_root, config)
     save_stage_entries(bind_root, {})
     save_conflict_entries(bind_root, {})
+    replace_base_snapshot(bind_root, {})
     try:
         replace_base_snapshot(bind_root, zip_map(session.download_zip(project["id"])))
     except RemoteZipDownloadError as exc:
         click.echo(f"[WARN] {exc}")
-        click.echo("[WARN] Remote merge base was not initialized; first pull may be more conservative.")
+        click.echo("[WARN] Remote merge base was reset; first pull will be conservative until initialization succeeds.")
     session.persist(str(store_abs_path))
     click.echo(f"Bound {bind_root} to Overleaf project '{config.project_name}'.")
     click.echo(f"config: {config_path}")
@@ -1210,8 +1266,8 @@ def push(dry_run: bool) -> None:
     if stage_entries:
         print_staged_entries(stage_entries)
     if dry_run:
-        state = collect_sync_state(session, project, sync_root, olignore_path)
         if stage_entries:
+            state = collect_sync_state(session, project, sync_root, olignore_path)
             plan = {
                 "push_new": [path for path in sorted(stage_entries) if path in state["local_files"] and path not in state["remote_zip"]],
                 "push_replace": [path for path in sorted(stage_entries) if path in state["local_files"] and path in state["remote_zip"]],
@@ -1223,28 +1279,23 @@ def push(dry_run: bool) -> None:
                 "conflicts": [],
             }
         else:
-            plan = build_sync_plan(
-                state["local_files"],
-                state["remote_zip"],
-                state["remote_entities"],
-                state["remote_folders"],
-                True,
-                False,
-            )
+            plan = build_local_push_preview_plan(session, project, sync_root, olignore_path)
         print_sync_plan(plan)
     elif stage_entries:
-        pushed = push_staged_entries(
+        def mark_staged_path_applied(rel_path: str) -> None:
+            update_base_snapshot_from_local_paths(binding_root, sync_root, {rel_path})
+            stage_entries.pop(rel_path, None)
+            save_stage_entries(binding_root, stage_entries)
+
+        push_staged_entries(
             session,
             project,
             sync_root,
             olignore_path,
             stage_entries,
             realtime_factory=RealtimeProjectClient,
+            on_applied=mark_staged_path_applied,
         )
-        update_base_snapshot_from_local_paths(binding_root, sync_root, set(pushed))
-        for rel_path in pushed:
-            stage_entries.pop(rel_path, None)
-        save_stage_entries(binding_root, stage_entries)
     else:
         sync_project(
             session,
@@ -1329,11 +1380,14 @@ def repo_init(project_name: str, store_path: str | None, sync_path: str, olignor
         default_branch=default_branch,
     )
     config_path = write_bridge_config(repo_root, config)
+    save_stage_entries(repo_root, {})
+    save_conflict_entries(repo_root, {})
+    replace_base_snapshot(repo_root, {})
     try:
         replace_base_snapshot(repo_root, zip_map(session.download_zip(project["id"])))
     except RemoteZipDownloadError as exc:
         click.echo(f"[WARN] {exc}")
-        click.echo("[WARN] Remote merge base was not initialized; first pull may be more conservative.")
+        click.echo("[WARN] Remote merge base was reset; first pull will be conservative until initialization succeeds.")
     session.persist(str(store_abs_path))
 
     click.echo(f"Wrote bridge config to {config_path}")
@@ -1354,23 +1408,34 @@ def repo_status() -> None:
         ignored_untracked_paths=bridge_ignored_untracked_paths(repo_root, config),
     )
     session, project, store_path, sync_root, olignore_path = bridge_session_and_project(repo_root, config)
-    state = collect_sync_state(session, project, sync_root, olignore_path)
-    push_plan = build_sync_plan(
-        state["local_files"],
-        state["remote_zip"],
-        state["remote_entities"],
-        state["remote_folders"],
-        True,
-        False,
-    )
-    pull_plan = build_sync_plan(
-        state["local_files"],
-        state["remote_zip"],
-        state["remote_entities"],
-        state["remote_folders"],
-        False,
-        True,
-    )
+    try:
+        state = collect_sync_state(session, project, sync_root, olignore_path)
+        push_plan = build_sync_plan(
+            state["local_files"],
+            state["remote_zip"],
+            state["remote_entities"],
+            state["remote_folders"],
+            True,
+            False,
+        )
+        pull_plan = build_sync_plan(
+            state["local_files"],
+            state["remote_zip"],
+            state["remote_entities"],
+            state["remote_folders"],
+            False,
+            True,
+        )
+    except RemoteZipDownloadError as exc:
+        click.echo(f"[WARN] {exc}")
+        click.echo("[WARN] Showing a metadata-only push summary; pull summary is unavailable until the remote archive is reachable.")
+        state = collect_tree_sync_state(session, project, sync_root, olignore_path)
+        push_plan = build_metadata_only_local_push_plan(
+            state["local_files"],
+            state["remote_entities"],
+            state["remote_folders"],
+        )
+        pull_plan = None
     print_bridge_status(git_status, config, push_plan, pull_plan, sync_root)
     print_conflict_entries(load_conflict_entries(repo_root))
     session.persist(str(store_path))
@@ -1580,15 +1645,18 @@ def status(local_only: bool, remote_only: bool, project_name: str, cookie_path: 
     )
     session = OverleafSession(load_store(str(store_path)))
     project = session.get_project(resolved_project_name)
-    state = collect_sync_state(session, project, sync_root, resolved_olignore_path)
-    plan = build_sync_plan(
-        state["local_files"],
-        state["remote_zip"],
-        state["remote_entities"],
-        state["remote_folders"],
-        local_only,
-        remote_only,
-    )
+    if local_only and not remote_only:
+        plan = build_local_push_preview_plan(session, project, sync_root, resolved_olignore_path)
+    else:
+        state = collect_sync_state(session, project, sync_root, resolved_olignore_path)
+        plan = build_sync_plan(
+            state["local_files"],
+            state["remote_zip"],
+            state["remote_entities"],
+            state["remote_folders"],
+            local_only,
+            remote_only,
+        )
     if binding_root is not None:
         print_conflict_entries(load_conflict_entries(binding_root))
         print_staged_entries(load_stage_entries(binding_root))

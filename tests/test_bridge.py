@@ -160,6 +160,23 @@ class BridgeHelpersTest(unittest.TestCase):
             primary.write_text("primary.tmp\n", encoding="utf-8")
             self.assertEqual(cli.ignore_patterns(primary), ["primary.tmp"])
 
+    def test_bridge_ignored_untracked_paths_uses_configured_ovsignore(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            config = cli.BridgeConfig(
+                version=cli.BRIDGE_CONFIG_VERSION,
+                project_name="Demo Project",
+                store_path=".overleaf-sync-auth",
+                sync_path=".",
+                olignore="config/custom.ovsignore",
+                git_remote="origin",
+                default_branch="main",
+            )
+
+            ignored = cli.bridge_ignored_untracked_paths(repo_root, config)
+
+        self.assertIn("config/custom.ovsignore", ignored)
+
     def test_download_zip_wraps_request_timeout(self) -> None:
         session = cli.OverleafSession({"cookie": {}, "csrf": "token"})
         with mock.patch.object(session.session, "request", side_effect=reqs.Timeout("zip timeout")) as request:
@@ -334,6 +351,29 @@ class BridgeCommandsTest(unittest.TestCase):
             self.assertEqual(config_data["sync_path"], ".")
             self.assertEqual(config_data["store_path"], "global/auth-store.pkl")
 
+    def test_bind_force_clears_stale_base_when_remote_zip_unavailable(self) -> None:
+        class ZipFailSession(DummySession):
+            def download_zip(self, project_id: str) -> bytes:
+                raise cli.RemoteZipDownloadError("zip export stalled")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bind_root = Path(tmpdir)
+            (bind_root / ".overleaf-sync-auth").write_bytes(b"auth")
+            write_bridge_config(bind_root, project_name="Old Project")
+            cli.write_base_snapshot(bind_root, "old.tex", b"old\n")
+            cli.save_stage_entries(bind_root, {"old.tex": {"local_hash": "abc", "remote_hash": "def"}})
+            cli.set_conflict_entry(bind_root, "old.tex", b"ours\n", b"theirs\n")
+
+            with working_directory(bind_root), mock.patch.object(cli, "load_store", return_value={"cookie": {}, "csrf": "token"}), mock.patch.object(
+                cli, "OverleafSession", ZipFailSession
+            ):
+                result = self.runner.invoke(cli.main, ["bind", "--force", "--name", "New Project"])
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertEqual(cli.read_base_snapshot_map(bind_root), {})
+            self.assertEqual(cli.load_stage_entries(bind_root), {})
+            self.assertEqual(cli.load_conflict_entries(bind_root), {})
+
     def test_push_uses_existing_binding(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             bind_root = Path(tmpdir)
@@ -470,6 +510,53 @@ class BridgeCommandsTest(unittest.TestCase):
             self.assertNotEqual(result.exit_code, 0)
             self.assertIn("Remote content changed after `ovs add`", result.output)
 
+    def test_push_keeps_only_unapplied_stage_entries_after_partial_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bind_root = Path(tmpdir)
+            auth_path = bind_root / ".overleaf-sync-auth"
+            auth_path.write_bytes(b"auth")
+            olignore_path = bind_root / ".ovsignore"
+            olignore_path.write_text("", encoding="utf-8")
+            first_path = bind_root / "first.tex"
+            second_path = bind_root / "second.tex"
+            first_path.write_text("first\n", encoding="utf-8")
+            second_path.write_text("second\n", encoding="utf-8")
+            write_bridge_config(bind_root, project_name="Bound Project")
+            cli.save_stage_entries(
+                bind_root,
+                {
+                    "first.tex": {"local_hash": cli.file_sha256(b"first\n"), "remote_hash": None},
+                    "second.tex": {"local_hash": cli.file_sha256(b"second\n"), "remote_hash": None},
+                },
+            )
+
+            state = {
+                "local_files": {"first.tex": first_path, "second.tex": second_path},
+                "remote_zip": {},
+                "remote_folders": {},
+                "remote_entities": {},
+                "root_folder_id": "root",
+            }
+            session = mock.Mock()
+            session.upload_file.side_effect = [
+                {"success": True, "entity_type": "file", "entity_id": "file-1"},
+                click.ClickException("upload failed"),
+            ]
+
+            with working_directory(bind_root), mock.patch.object(
+                cli,
+                "bridge_session_and_project",
+                return_value=(session, {"id": "project-1", "name": "Bound Project"}, auth_path, bind_root, olignore_path),
+            ), mock.patch.object(sync_engine, "collect_sync_state", return_value=state), mock.patch.object(
+                sync_engine, "ensure_remote_folder", return_value="root"
+            ):
+                result = self.runner.invoke(cli.main, ["push"])
+
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertEqual(cli.load_stage_entries(bind_root), {"second.tex": {"local_hash": cli.file_sha256(b"second\n"), "remote_hash": None}})
+            self.assertEqual(cli.read_base_snapshot_map(bind_root)["first.tex"], b"first\n")
+            self.assertNotIn("second.tex", cli.read_base_snapshot_map(bind_root))
+
     def test_push_rejects_unresolved_conflicts(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             bind_root = Path(tmpdir)
@@ -542,6 +629,38 @@ class BridgeCommandsTest(unittest.TestCase):
             self.assertIn("project: Demo Project", result.output)
             self.assertIn("push-overleaf: push_new=1, remote_delete=1", result.output)
             self.assertIn("pull-overleaf: pull_new=1, local_delete=1", result.output)
+
+    def test_repo_status_falls_back_to_metadata_only_push_summary_when_zip_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir) / "repo"
+            init_repo(repo_root)
+            git(["remote", "add", "origin", "https://example.com/demo.git"], cwd=repo_root)
+            write_bridge_config(repo_root)
+            (repo_root / ".overleaf-sync-auth").write_bytes(b"auth")
+            local_path = repo_root / "draft.tex"
+            local_path.write_text("draft\n", encoding="utf-8")
+            state = {
+                "local_files": {"draft.tex": local_path},
+                "remote_zip": {},
+                "remote_folders": {},
+                "remote_entities": {"server.tex": {"kind": "doc", "id": "doc-1", "path": "server.tex"}},
+                "root_folder_id": "root",
+                "remote_zip_available": False,
+            }
+
+            with mock.patch.object(cli, "load_store", return_value={"cookie": {}, "csrf": "token"}), mock.patch.object(
+                cli, "OverleafSession", DummySession
+            ), mock.patch.object(
+                cli,
+                "collect_sync_state",
+                side_effect=cli.RemoteZipDownloadError("zip export stalled"),
+            ), mock.patch.object(cli, "collect_tree_sync_state", return_value=state):
+                with working_directory(repo_root):
+                    result = self.runner.invoke(cli.main, ["repo", "status"])
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertIn("metadata-only push summary", result.output)
+            self.assertIn("pull-overleaf: unavailable", result.output)
 
     def test_bridge_push_github_rejects_dirty_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -763,6 +882,36 @@ class SyncFallbackTest(unittest.TestCase):
         self.assertIn("[1/3 REMOTE DELETE] old.txt", messages)
         self.assertIn("[2/3 LOCAL -> REMOTE] big.bin", messages)
         self.assertIn("[3/3 REMOTE DELETE FOLDER] old", messages)
+
+    def test_status_local_only_falls_back_to_metadata_preview_when_zip_unavailable(self) -> None:
+        runner = CliRunner()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bind_root = Path(tmpdir)
+            (bind_root / ".overleaf-sync-auth").write_bytes(b"auth")
+            write_bridge_config(bind_root, project_name="Bound Project")
+            local_path = bind_root / "draft.tex"
+            local_path.write_text("draft\n", encoding="utf-8")
+            state = {
+                "local_files": {"draft.tex": local_path},
+                "remote_zip": {},
+                "remote_folders": {},
+                "remote_entities": {"server.tex": {"kind": "doc", "id": "doc-1", "path": "server.tex"}},
+                "root_folder_id": "root",
+                "remote_zip_available": False,
+            }
+
+            with working_directory(bind_root), mock.patch.object(cli, "load_store", return_value={"cookie": {}, "csrf": "token"}), mock.patch.object(
+                cli, "OverleafSession", DummySession
+            ), mock.patch.object(
+                cli,
+                "collect_sync_state",
+                side_effect=cli.RemoteZipDownloadError("zip export stalled"),
+            ), mock.patch.object(cli, "collect_tree_sync_state", return_value=state):
+                result = runner.invoke(cli.main, ["status", "-l"])
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertIn("metadata-only local push preview", result.output)
+            self.assertIn("[PLAN LOCAL -> REMOTE NEW] draft.tex", result.output)
 
     def test_sync_project_falls_back_for_local_only_push(self) -> None:
         session = mock.Mock()

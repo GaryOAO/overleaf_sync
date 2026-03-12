@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <code>exact sync</code> · <code>remote tree</code> · <code>compile artifacts</code> · <code>GitHub + Overleaf repo workflow</code>
+  <code>bind + push/pull</code> · <code>staged Overleaf updates</code> · <code>remote tree</code> · <code>GitHub + Overleaf repo workflow</code>
 </p>
 
 Overleaf Sync is a CLI for working with an existing Overleaf project from a local folder or a local Git repository.
@@ -22,6 +22,7 @@ Overleaf Sync is a CLI for working with an existing Overleaf project from a loca
 It focuses on three jobs:
 
 - exact folder sync between your working tree and Overleaf
+- a git-like bound workflow with `bind`, `add`, `push`, `pull`, `status`
 - access to compile outputs beyond `output.pdf`
 - a repo workflow where GitHub and Overleaf are driven from one local checkout
 - warnings before destructive sync actions and step-by-step progress during sync
@@ -30,15 +31,21 @@ It focuses on three jobs:
 
 ```mermaid
 flowchart LR
-  A["Local working tree"] -->|"ovs -l"| B["Overleaf project"]
-  B -->|"ovs -r"| A
-  B -->|"ovs artifacts"| C["PDF, log, aux, synctex, stderr"]
+  A["Local working tree"] -->|"ovs bind"| B["Bound Overleaf project"]
+  A -->|"ovs add"| C["Staged Overleaf paths"]
+  C -->|"ovs push"| B
+  B -->|"ovs pull"| A
+  B -->|"ovs artifacts"| E["PDF, log, aux, synctex, stderr"]
   A -->|"ovs repo push-github"| D["GitHub / origin"]
   A -->|"ovs repo push-overleaf"| B
 ```
 
 | You want to... | Use this |
 | --- | --- |
+| bind the current folder once, then push/pull without project flags | `ovs bind --name "Project"` |
+| stage selected paths before pushing to Overleaf | `ovs add path/to/file.tex` |
+| push staged paths or all bound changes | `ovs push` |
+| pull remote changes into the bound folder | `ovs pull` |
 | push local files to Overleaf | `ovs -l --name "Project"` |
 | pull remote files to local | `ovs -r --name "Project"` |
 | preview sync actions first | `ovs --dry-run ...` or `ovs status ...` |
@@ -80,6 +87,18 @@ If a local `.overleaf-sync-auth` or `.olauth` exists in the current sync folder,
 ### 2. Sync a local folder with Overleaf
 
 ```bash
+# Bind once
+ovs bind --name "My Overleaf Project"
+
+# Stage the files you want to send
+ovs add sections/intro.tex figures/arch.pdf
+
+# Push staged changes
+ovs push
+
+# Pull remote changes later
+ovs pull
+
 # Push local files to Overleaf
 ovs -l --name "My Overleaf Project"
 
@@ -139,6 +158,11 @@ ovs repo pull-overleaf
 
 ### Core sync
 
+- `ovs bind`
+- `ovs add`
+- `ovs reset`
+- `ovs push`
+- `ovs pull`
 - `ovs login`
 - `ovs list`
 - `ovs -l`
@@ -170,6 +194,10 @@ Backward compatibility note:
 
 Most Overleaf scripts stop at "upload files". This one does not.
 
+- `bind` writes `.overleaf-sync.json` in the current folder so later `push`, `pull`, `status`, `tree`, `artifacts`, and `download` can infer the Overleaf project automatically.
+- `add` writes a small local stage file and records both the local content hash and the remote content hash at staging time.
+- `push` can then reject stale stages when the Overleaf side changed after `ovs add`, instead of silently overwriting newer remote edits.
+- `pull` refuses to overwrite a folder that still has staged Overleaf updates pending.
 - GitHub operations use your existing local Git repository, its configured `origin`, and your local Git credentials.
 - Overleaf operations still use the auth store plus the current sync engine.
 - `repo init` writes `.overleaf-sync.json` into the Git repo root.
@@ -187,9 +215,9 @@ That difference is intentional:
 
 ## Config Files
 
-### `.olignore`
+### `.ovsignore`
 
-`.olignore` is read from the sync root and excludes matching paths before reconciliation.
+`.ovsignore` is read from the sync root and excludes matching paths before reconciliation.
 
 Example:
 
@@ -203,6 +231,7 @@ Example:
 output/*
 .overleaf-sync-auth
 .olauth
+.ovs-stage.json
 ```
 
 ### `.overleaf-sync.json`
@@ -212,12 +241,17 @@ Created by `ovs repo init` in the Git repo root. It stores:
 - Overleaf project name
 - auth store path
 - sync path
-- `.olignore` path
+- `.ovsignore` path
 - Git remote
 - default branch
 
 It is hidden, so it is not synced to Overleaf by the current sync rules.
 If you initialized the repo after a global `ovs login`, this auth path may point to the global store instead of a file inside the repository.
+
+### `.ovs-stage.json`
+
+Created by `ovs add`. It stores the staged Overleaf paths plus the local/remote content fingerprints captured at staging time.
+`ovs push` uses it to detect when the remote file changed after staging.
 
 ## Security
 
@@ -226,6 +260,7 @@ Do not commit these unless you know exactly why:
 - `.overleaf-sync-auth`
 - `.olauth`
 - `.overleaf-sync.json` if the repo/project mapping is sensitive
+- `.ovs-stage.json`
 - downloaded PDFs or compile artifacts if they contain private content
 
 This repository does not include any auth store, cookies, private Overleaf project data, or local export artifacts.

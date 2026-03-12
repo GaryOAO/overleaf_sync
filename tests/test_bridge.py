@@ -45,7 +45,7 @@ def write_bridge_config(
     project_name: str = "Demo Project",
     store_path: str = ".overleaf-sync-auth",
     sync_path: str = ".",
-    olignore: str = ".olignore",
+    olignore: str = ".ovsignore",
     git_remote: str = "origin",
     default_branch: str = "main",
 ) -> None:
@@ -132,6 +132,24 @@ class BridgeHelpersTest(unittest.TestCase):
                 resolved = cli.resolve_auth_store_path(None)
 
             self.assertEqual(resolved, global_store.resolve())
+
+    def test_find_bound_root_searches_parents(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            nested = root / "a" / "b"
+            nested.mkdir(parents=True)
+            write_bridge_config(root, project_name="Bound Project")
+
+            resolved = cli.find_bound_root(nested)
+
+            self.assertEqual(resolved, root.resolve())
+
+    def test_ignore_patterns_reads_ovsignore(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            primary = root / ".ovsignore"
+            primary.write_text("primary.tmp\n", encoding="utf-8")
+            self.assertEqual(cli.ignore_patterns(primary), ["primary.tmp"])
 
     def test_download_zip_wraps_request_timeout(self) -> None:
         session = cli.OverleafSession({"cookie": {}, "csrf": "token"})
@@ -279,6 +297,161 @@ class BridgeCommandsTest(unittest.TestCase):
             self.assertEqual(result.exit_code, 0, result.output)
             config_data = json.loads((repo_root / ".overleaf-sync.json").read_text(encoding="utf-8"))
             self.assertEqual(config_data["store_path"], str(global_store.resolve()))
+
+    def test_bind_writes_binding_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bind_root = Path(tmpdir)
+            global_store = bind_root / "global" / "auth-store.pkl"
+            cli.save_store(str(global_store), {"sid": "cookie"}, "token")
+
+            with working_directory(bind_root), mock.patch.object(cli, "global_store_path", return_value=global_store), mock.patch.object(
+                cli, "load_store", return_value={"cookie": {}, "csrf": "token"}
+            ), mock.patch.object(cli, "OverleafSession", DummySession):
+                result = self.runner.invoke(cli.main, ["bind", "--name", "Paper Project"])
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            config_data = json.loads((bind_root / ".overleaf-sync.json").read_text(encoding="utf-8"))
+            self.assertEqual(config_data["project_name"], "Paper Project")
+            self.assertEqual(config_data["sync_path"], ".")
+            self.assertEqual(config_data["store_path"], "global/auth-store.pkl")
+
+    def test_push_uses_existing_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bind_root = Path(tmpdir)
+            (bind_root / ".overleaf-sync-auth").write_bytes(b"auth")
+            write_bridge_config(bind_root, project_name="Bound Project")
+
+            with working_directory(bind_root), mock.patch.object(cli, "load_store", return_value={"cookie": {}, "csrf": "token"}), mock.patch.object(
+                cli, "OverleafSession", DummySession
+            ), mock.patch.object(cli, "sync_project") as sync_project:
+                result = self.runner.invoke(cli.main, ["push"])
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            sync_project.assert_called_once()
+            self.assertTrue(sync_project.call_args.kwargs["local_only"])
+            self.assertFalse(sync_project.call_args.kwargs["remote_only"])
+
+    def test_pull_uses_existing_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bind_root = Path(tmpdir)
+            (bind_root / ".overleaf-sync-auth").write_bytes(b"auth")
+            write_bridge_config(bind_root, project_name="Bound Project")
+
+            with working_directory(bind_root), mock.patch.object(cli, "load_store", return_value={"cookie": {}, "csrf": "token"}), mock.patch.object(
+                cli, "OverleafSession", DummySession
+            ), mock.patch.object(cli, "sync_project") as sync_project:
+                result = self.runner.invoke(cli.main, ["pull"])
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            sync_project.assert_called_once()
+            self.assertFalse(sync_project.call_args.kwargs["local_only"])
+            self.assertTrue(sync_project.call_args.kwargs["remote_only"])
+
+    def test_status_uses_binding_when_name_omitted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bind_root = Path(tmpdir)
+            (bind_root / ".overleaf-sync-auth").write_bytes(b"auth")
+            local_path = bind_root / "draft.tex"
+            local_path.write_text("draft\n", encoding="utf-8")
+            write_bridge_config(bind_root, project_name="Bound Project")
+
+            state = {
+                "local_files": {"draft.tex": local_path},
+                "remote_zip": {"server.tex": b"remote\n"},
+                "remote_folders": {},
+                "remote_entities": {"server.tex": {"kind": "doc", "id": "doc-1", "path": "server.tex"}},
+                "root_folder_id": "root",
+            }
+
+            with working_directory(bind_root), mock.patch.object(cli, "load_store", return_value={"cookie": {}, "csrf": "token"}), mock.patch.object(
+                cli, "OverleafSession", DummySession
+            ), mock.patch.object(cli, "collect_sync_state", return_value=state):
+                result = self.runner.invoke(cli.main, ["status"])
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertIn("[PLAN LOCAL -> REMOTE NEW] draft.tex", result.output)
+
+    def test_repo_status_rejects_non_repo_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir) / "repo"
+            init_repo(repo_root)
+            write_bridge_config(repo_root, project_name="Bound Project", git_remote="", default_branch="")
+
+            with working_directory(repo_root):
+                result = self.runner.invoke(cli.main, ["repo", "status"])
+
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertIn("does not include GitHub settings", result.output)
+
+    def test_add_creates_stage_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bind_root = Path(tmpdir)
+            local_path = bind_root / "draft.tex"
+            local_path.write_text("draft\n", encoding="utf-8")
+            (bind_root / ".overleaf-sync-auth").write_bytes(b"auth")
+            write_bridge_config(bind_root, project_name="Bound Project")
+            state = {
+                "local_files": {"draft.tex": local_path},
+                "remote_zip": {"draft.tex": b"remote\n"},
+                "remote_folders": {},
+                "remote_entities": {"draft.tex": {"kind": "doc", "id": "doc-1", "path": "draft.tex"}},
+                "root_folder_id": "root",
+            }
+
+            with working_directory(bind_root), mock.patch.object(cli, "load_store", return_value={"cookie": {}, "csrf": "token"}), mock.patch.object(
+                cli, "OverleafSession", DummySession
+            ), mock.patch.object(cli, "collect_sync_state", return_value=state):
+                result = self.runner.invoke(cli.main, ["add", "draft.tex"])
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            stage_data = json.loads((bind_root / ".ovs-stage.json").read_text(encoding="utf-8"))
+            self.assertIn("draft.tex", stage_data)
+            self.assertEqual(stage_data["draft.tex"]["local_hash"], cli.file_sha256(b"draft\n"))
+            self.assertEqual(stage_data["draft.tex"]["remote_hash"], cli.file_sha256(b"remote\n"))
+
+    def test_reset_clears_stage_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bind_root = Path(tmpdir)
+            write_bridge_config(bind_root, project_name="Bound Project")
+            cli.save_stage_entries(bind_root, {"draft.tex": {"local_hash": "abc", "remote_hash": "def"}})
+
+            with working_directory(bind_root):
+                result = self.runner.invoke(cli.main, ["reset", "--all"])
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertFalse((bind_root / ".ovs-stage.json").exists())
+
+    def test_push_rejects_when_remote_changed_after_add(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bind_root = Path(tmpdir)
+            local_path = bind_root / "draft.tex"
+            local_path.write_text("draft\n", encoding="utf-8")
+            (bind_root / ".overleaf-sync-auth").write_bytes(b"auth")
+            write_bridge_config(bind_root, project_name="Bound Project")
+            cli.save_stage_entries(
+                bind_root,
+                {
+                    "draft.tex": {
+                        "local_hash": cli.file_sha256(b"draft\n"),
+                        "remote_hash": cli.file_sha256(b"remote-before\n"),
+                    }
+                },
+            )
+            state = {
+                "local_files": {"draft.tex": local_path},
+                "remote_zip": {"draft.tex": b"remote-after\n"},
+                "remote_folders": {},
+                "remote_entities": {"draft.tex": {"kind": "doc", "id": "doc-1", "path": "draft.tex", "parent_folder_id": "root", "name": "draft.tex"}},
+                "root_folder_id": "root",
+            }
+
+            with working_directory(bind_root), mock.patch.object(cli, "load_store", return_value={"cookie": {}, "csrf": "token"}), mock.patch.object(
+                cli, "OverleafSession", DummySession
+            ), mock.patch.object(cli, "collect_sync_state", return_value=state):
+                result = self.runner.invoke(cli.main, ["push"])
+
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertIn("Remote content changed after `ovs add`", result.output)
 
     def test_bridge_status_reports_git_and_overleaf_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -442,7 +615,7 @@ class SyncFallbackTest(unittest.TestCase):
             sync_root = Path(tmpdir)
             local_path = sync_root / "big.bin"
             local_path.write_bytes(b"0123456789")
-            olignore_path = sync_root / ".olignore"
+            olignore_path = sync_root / ".ovsignore"
             olignore_path.write_text("", encoding="utf-8")
 
             state = {
@@ -475,7 +648,7 @@ class SyncFallbackTest(unittest.TestCase):
         project = {"id": "project-1"}
         with tempfile.TemporaryDirectory() as tmpdir:
             sync_root = Path(tmpdir)
-            olignore_path = sync_root / ".olignore"
+            olignore_path = sync_root / ".ovsignore"
             olignore_path.write_text("", encoding="utf-8")
 
             with mock.patch.object(
@@ -497,7 +670,7 @@ class SyncFallbackTest(unittest.TestCase):
         project = {"id": "project-1"}
         with tempfile.TemporaryDirectory() as tmpdir:
             sync_root = Path(tmpdir)
-            olignore_path = sync_root / ".olignore"
+            olignore_path = sync_root / ".ovsignore"
             olignore_path.write_text("", encoding="utf-8")
 
             with mock.patch.object(

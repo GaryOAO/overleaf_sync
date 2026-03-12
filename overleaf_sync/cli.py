@@ -10,6 +10,7 @@ import mimetypes
 import pickle
 import posixpath
 import re
+import hashlib
 import ssl
 import subprocess
 import time
@@ -38,12 +39,13 @@ BRIDGE_CONFIG_NAME = ".overleaf-sync.json"
 BRIDGE_CONFIG_VERSION = 1
 DEFAULT_GIT_REMOTE = "origin"
 DEFAULT_STORE_PATH = ".overleaf-sync-auth"
-DEFAULT_OLIGNORE = ".olignore"
+DEFAULT_OLIGNORE = ".ovsignore"
 LEGACY_STORE_PATHS = (
     DEFAULT_STORE_PATH,
     ".olauth",
 )
 GLOBAL_STORE_FILENAME = "auth-store.pkl"
+STAGE_FILE_NAME = ".ovs-stage.json"
 DEFAULT_REQUEST_TIMEOUT = (10, 30)
 DOWNLOAD_ZIP_TIMEOUT = (10, 60)
 LARGE_FILE_WARNING_BYTES = 10 * 1024 * 1024
@@ -51,6 +53,8 @@ LOCAL_BRIDGE_METADATA_FILES = {
     BRIDGE_CONFIG_NAME,
     DEFAULT_STORE_PATH,
     ".olauth",
+    STAGE_FILE_NAME,
+    DEFAULT_OLIGNORE,
 }
 AUTH_STORE_OPTION_DEFAULT = "local .overleaf-sync-auth/.olauth, else saved global auth"
 LOGIN_STORE_OPTION_DEFAULT = "saved global auth"
@@ -184,8 +188,8 @@ class BridgeConfig:
     store_path: str
     sync_path: str
     olignore: str
-    git_remote: str
-    default_branch: str
+    git_remote: str = ""
+    default_branch: str = ""
 
 
 @dataclass(frozen=True)
@@ -235,6 +239,44 @@ def resolve_cli_path(value: str, *, base_dir: Path | None = None) -> Path:
     if path.is_absolute():
         return path.resolve()
     return ((base_dir or Path.cwd()).resolve() / path).resolve()
+
+
+def stage_file_path(root: Path) -> Path:
+    return root / STAGE_FILE_NAME
+
+
+def load_stage_entries(root: Path) -> dict[str, dict[str, str | None]]:
+    path = stage_file_path(root)
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise click.ClickException(f"Failed to read stage file at {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise click.ClickException(f"Invalid stage file at {path}.")
+    entries: dict[str, dict[str, str | None]] = {}
+    for rel_path, payload in data.items():
+        if not isinstance(payload, dict):
+            raise click.ClickException(f"Invalid staged entry for {rel_path} in {path}.")
+        entries[str(rel_path)] = {
+            "local_hash": payload.get("local_hash"),
+            "remote_hash": payload.get("remote_hash"),
+        }
+    return entries
+
+
+def save_stage_entries(root: Path, entries: dict[str, dict[str, str | None]]) -> None:
+    path = stage_file_path(root)
+    if not entries:
+        if path.exists():
+            path.unlink()
+        return
+    path.write_text(json.dumps(entries, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def file_sha256(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
 
 
 def auth_store_candidates(search_roots: list[Path] | None = None) -> list[Path]:
@@ -336,6 +378,18 @@ def bridge_config_path(repo_root: Path) -> Path:
     return repo_root / BRIDGE_CONFIG_NAME
 
 
+def find_bound_root(start_path: Path | None = None, *, required: bool = True) -> Path | None:
+    current = (start_path or Path.cwd()).resolve()
+    for candidate in (current, *current.parents):
+        if bridge_config_path(candidate).is_file():
+            return candidate
+    if required:
+        raise click.ClickException(
+            f"No Overleaf binding found from {current}. Run `ovs bind --name \"Your Project\"` first."
+        )
+    return None
+
+
 def parse_git_status_porcelain(output: str) -> dict[str, object]:
     lines = output.splitlines()
     header = lines[0] if lines else ""
@@ -430,6 +484,14 @@ def bridge_ignored_untracked_paths(repo_root: Path, config: BridgeConfig) -> set
     return ignored
 
 
+def require_repo_binding(config: BridgeConfig) -> None:
+    if config.git_remote and config.default_branch:
+        return
+    raise click.ClickException(
+        "Current binding does not include GitHub settings. Run `ovs repo init` first."
+    )
+
+
 def load_bridge_config(repo_root: Path) -> BridgeConfig:
     config_path = bridge_config_path(repo_root)
     if not config_path.is_file():
@@ -446,8 +508,6 @@ def load_bridge_config(repo_root: Path) -> BridgeConfig:
         "store_path",
         "sync_path",
         "olignore",
-        "git_remote",
-        "default_branch",
     }
     missing_fields = sorted(required_fields - set(data))
     if missing_fields:
@@ -463,8 +523,8 @@ def load_bridge_config(repo_root: Path) -> BridgeConfig:
         store_path=str(data["store_path"]),
         sync_path=str(data["sync_path"]),
         olignore=str(data["olignore"]),
-        git_remote=str(data["git_remote"]),
-        default_branch=str(data["default_branch"]),
+        git_remote=str(data.get("git_remote", "")),
+        default_branch=str(data.get("default_branch", "")),
     )
 
 
@@ -563,9 +623,9 @@ def require_clean_worktree(git_status: GitStatusSummary) -> None:
 
 
 def ignore_patterns(olignore_path: Path) -> list[str]:
-    if not olignore_path.is_file():
-        return []
-    return [line.strip() for line in olignore_path.read_text().splitlines() if line.strip()]
+    if olignore_path.is_file():
+        return [line.strip() for line in olignore_path.read_text().splitlines() if line.strip()]
+    return []
 
 
 def should_ignore(rel_path: str, patterns: list[str]) -> bool:
@@ -589,6 +649,18 @@ def collect_local_files(sync_path: Path, patterns: list[str]) -> dict[str, Path]
             continue
         result[rel_path] = file_path
     return result
+
+
+def normalize_stage_path(sync_root: Path, value: str) -> str:
+    raw_path = Path(value).expanduser()
+    if raw_path.is_absolute():
+        candidate = raw_path.resolve()
+    else:
+        candidate = (Path.cwd() / raw_path).resolve()
+    try:
+        return candidate.relative_to(sync_root).as_posix()
+    except ValueError as exc:
+        raise click.ClickException(f"Path '{value}' is outside the bound sync root {sync_root}.") from exc
 
 
 def zip_map(zip_bytes: bytes) -> dict[str, bytes]:
@@ -1644,6 +1716,102 @@ def sync_project(session: OverleafSession, project: dict, sync_path: Path, olign
         click.echo(f"{progress_prefix(progress, 'REMOTE DELETE FOLDER')} {folder_path}")
 
 
+def print_staged_entries(entries: dict[str, dict[str, str | None]]) -> None:
+    if not entries:
+        return
+    click.echo("Staged:")
+    for rel_path in sorted(entries):
+        click.echo(f"  {rel_path}")
+    click.echo("")
+
+
+def push_staged_entries(
+    session: OverleafSession,
+    project: dict,
+    sync_root: Path,
+    olignore_path: Path,
+    stage_entries: dict[str, dict[str, str | None]],
+) -> list[str]:
+    state = collect_sync_state(session, project, sync_root, olignore_path)
+    local_files = state["local_files"]
+    remote_zip = state["remote_zip"]
+    remote_folders = state["remote_folders"]
+    remote_entities = state["remote_entities"]
+    root_folder_id = state["root_folder_id"]
+
+    actions: list[tuple[str, str, Path | None, dict | None]] = []
+    for rel_path in sorted(stage_entries):
+        staged = stage_entries[rel_path]
+        local_path = local_files.get(rel_path)
+        remote_bytes = remote_zip.get(rel_path)
+        remote_entity = remote_entities.get(rel_path)
+        current_local_hash = file_sha256(local_path.read_bytes()) if local_path is not None else None
+        current_remote_hash = file_sha256(remote_bytes) if remote_bytes is not None else None
+        if current_local_hash != staged.get("local_hash"):
+            raise click.ClickException(f"Staged local content changed after `ovs add`: {rel_path}. Run `ovs add {rel_path}` again.")
+        if current_remote_hash != staged.get("remote_hash"):
+            raise click.ClickException(f"Remote content changed after `ovs add`: {rel_path}. Run `ovs pull` or review, then `ovs add {rel_path}` again.")
+
+        if local_path is None:
+            if remote_entity is not None:
+                actions.append(("delete", rel_path, None, remote_entity))
+            continue
+
+        if remote_bytes is not None and file_contents_match(local_path, remote_bytes, remote_entity):
+            actions.append(("noop", rel_path, local_path, remote_entity))
+            continue
+        actions.append(("push", rel_path, local_path, remote_entity))
+
+    progress = SyncProgressTracker(total=len([action for action in actions if action[0] != "noop"])) if any(
+        action[0] != "noop" for action in actions
+    ) else None
+    realtime = None
+    pushed: list[str] = []
+    try:
+        for action, rel_path, local_path, remote_entity in actions:
+            if action == "noop":
+                pushed.append(rel_path)
+                continue
+            if action == "delete":
+                session.delete_entity(project["id"], remote_entity)
+                click.echo(f"{progress_prefix(progress, 'REMOTE DELETE')} {rel_path}")
+                pushed.append(rel_path)
+                continue
+
+            assert local_path is not None
+            warn_for_large_upload(local_path, rel_path)
+            if remote_entity is not None and remote_entity["kind"] == "doc":
+                if realtime is None:
+                    realtime = RealtimeProjectClient(session, project["id"])
+                try:
+                    updated = realtime.update_doc(remote_entity["id"], read_local_text(local_path))
+                    if updated:
+                        click.echo(f"{progress_prefix(progress, 'LOCAL -> REMOTE OT')} {rel_path}")
+                        pushed.append(rel_path)
+                        continue
+                except (UnicodeDecodeError, click.ClickException) as exc:
+                    click.echo(f"[OT FALLBACK] {rel_path}: {exc}")
+
+            folder_path = posixpath.dirname(rel_path)
+            folder_id = ensure_remote_folder(session, project["id"], remote_folders, root_folder_id, folder_path)
+            if remote_entity is not None:
+                session.delete_entity(project["id"], remote_entity)
+            payload = session.upload_file(project["id"], folder_id, local_path)
+            remote_entities[rel_path] = {
+                "kind": "doc" if payload.get("entity_type") == "doc" else "file",
+                "id": payload["entity_id"],
+                "path": rel_path,
+                "parent_folder_id": folder_id,
+                "name": local_path.name,
+            }
+            click.echo(f"{progress_prefix(progress, 'LOCAL -> REMOTE')} {rel_path}")
+            pushed.append(rel_path)
+    finally:
+        if realtime is not None:
+            realtime.close()
+    return pushed
+
+
 def bridge_session_and_project(repo_root: Path, config: BridgeConfig) -> tuple[OverleafSession, dict, Path, Path, Path]:
     store_path = resolve_repo_path(repo_root, config.store_path)
     if not store_path.is_file():
@@ -1659,6 +1827,42 @@ def bridge_session_and_project(repo_root: Path, config: BridgeConfig) -> tuple[O
     return session, project, store_path, sync_root, olignore_path
 
 
+def resolve_bound_sync_context(
+    project_name: str,
+    cookie_path: str | None,
+    sync_path: str,
+    olignore_path: str,
+) -> tuple[Path, str, Path, Path, Path | None, BridgeConfig | None]:
+    binding_root = None
+    config = None
+    if not project_name and cookie_path is None and sync_path == "." and olignore_path == DEFAULT_OLIGNORE:
+        binding_root = find_bound_root(required=False)
+        if binding_root is not None:
+            config = load_bridge_config(binding_root)
+            store_path = resolve_repo_path(binding_root, config.store_path)
+            sync_root = resolve_repo_path(binding_root, config.sync_path)
+            return sync_root, config.project_name, store_path, resolve_repo_path(binding_root, config.olignore), binding_root, config
+
+    sync_root = Path(sync_path).resolve()
+    store_path = resolve_auth_store_path(cookie_path, search_roots=[sync_root])
+    return sync_root, project_name or sync_root.name, store_path, sync_root / olignore_path, binding_root, config
+
+
+def resolve_bound_project_context(
+    project_name: str,
+    cookie_path: str | None,
+) -> tuple[str, Path, Path | None, BridgeConfig | None]:
+    if not project_name and cookie_path is None:
+        binding_root = find_bound_root(required=False)
+        if binding_root is not None:
+            config = load_bridge_config(binding_root)
+            store_path = resolve_repo_path(binding_root, config.store_path)
+            return config.project_name, store_path, binding_root, config
+
+    store_path = resolve_auth_store_path(cookie_path)
+    return project_name or Path.cwd().name, store_path, None, None
+
+
 @click.group(invoke_without_command=True)
 @click.option("-l", "--local-only", "local_only", is_flag=True, help="Sync local files to Overleaf.")
 @click.option("-r", "--remote-only", "remote_only", is_flag=True, help="Sync remote files to local.")
@@ -1666,7 +1870,7 @@ def bridge_session_and_project(repo_root: Path, config: BridgeConfig) -> tuple[O
 @click.option("-n", "--name", "project_name", default="", help="Overleaf project name.")
 @click.option("--store-path", "cookie_path", default=None, show_default=AUTH_STORE_OPTION_DEFAULT, type=click.Path(exists=False), help=AUTH_STORE_OPTION_HELP)
 @click.option("-p", "--path", "sync_path", default=".", type=click.Path(exists=True), help="Local sync path.")
-@click.option("-i", "--olignore", "olignore_path", default=".olignore", type=click.Path(exists=False), help="Path to .olignore relative to sync path.")
+@click.option("-i", "--ovsignore", "olignore_path", default=DEFAULT_OLIGNORE, type=click.Path(exists=False), help="Path to .ovsignore relative to sync path.")
 @click.pass_context
 def main(ctx: click.Context, local_only: bool, remote_only: bool, dry_run: bool, project_name: str, cookie_path: str | None, sync_path: str, olignore_path: str) -> None:
     if ctx.invoked_subcommand is not None:
@@ -1674,13 +1878,16 @@ def main(ctx: click.Context, local_only: bool, remote_only: bool, dry_run: bool,
 
     if local_only and remote_only:
         raise click.ClickException("Use at most one of --local-only and --remote-only.")
-    sync_root = Path(sync_path).resolve()
-    store_path = resolve_auth_store_path(cookie_path, search_roots=[sync_root])
+    sync_root, resolved_project_name, store_path, resolved_olignore_path, _, _ = resolve_bound_sync_context(
+        project_name,
+        cookie_path,
+        sync_path,
+        olignore_path,
+    )
     session = OverleafSession(load_store(str(store_path)))
-    project_name = project_name or sync_root.name
-    project = session.get_project(project_name)
+    project = session.get_project(resolved_project_name)
     if dry_run:
-        state = collect_sync_state(session, project, sync_root, sync_root / olignore_path)
+        state = collect_sync_state(session, project, sync_root, resolved_olignore_path)
         plan = build_sync_plan(
             state["local_files"],
             state["remote_zip"],
@@ -1692,7 +1899,188 @@ def main(ctx: click.Context, local_only: bool, remote_only: bool, dry_run: bool,
         print_sync_plan(plan)
         session.persist(str(store_path))
         return
-    sync_project(session, project, sync_root, sync_root / olignore_path, local_only, remote_only)
+    sync_project(session, project, sync_root, resolved_olignore_path, local_only, remote_only)
+    session.persist(str(store_path))
+
+
+@main.command(name="bind")
+@click.option("-n", "--name", "project_name", default="", help="Overleaf project name. Defaults to the current directory name.")
+@click.option("--store-path", "store_path", default=None, show_default=AUTH_STORE_OPTION_DEFAULT, type=click.Path(exists=False), help=AUTH_STORE_OPTION_HELP)
+@click.option("-p", "--path", "sync_path", default=".", show_default=True, type=click.Path(exists=False), help="Local sync path, relative to the binding root.")
+@click.option("-i", "--ovsignore", "olignore_path", default=DEFAULT_OLIGNORE, show_default=True, type=click.Path(exists=False), help="Path to .ovsignore, relative to the binding root.")
+@click.option("--force", is_flag=True, help="Overwrite an existing binding in the current directory.")
+def bind(project_name: str, store_path: str | None, sync_path: str, olignore_path: str, force: bool) -> None:
+    bind_root = Path.cwd().resolve()
+    config_path = bridge_config_path(bind_root)
+    existing = None
+    if config_path.exists():
+        if not force:
+            raise click.ClickException(
+                f"Binding already exists at {config_path}. Use `ovs push` / `ovs pull`, or re-run with --force."
+            )
+        existing = load_bridge_config(bind_root)
+
+    normalized_sync_path = normalize_bridge_path(sync_path, "sync_path")
+    normalized_olignore = normalize_bridge_path(olignore_path, "olignore")
+    if store_path:
+        normalized_store_path = normalize_store_config_path(store_path)
+        store_abs_path = resolve_repo_path(bind_root, normalized_store_path)
+        if not store_abs_path.is_file():
+            raise click.ClickException(f"Persisted Overleaf auth store not found at {store_abs_path}. Run `ovs login` first.")
+    else:
+        store_abs_path = resolve_auth_store_path(None, search_roots=[bind_root])
+        normalized_store_path = display_store_config_path(bind_root, store_abs_path)
+
+    sync_root = resolve_repo_path(bind_root, normalized_sync_path)
+    if not sync_root.exists():
+        raise click.ClickException(f"Configured sync path does not exist: {sync_root}")
+
+    resolved_project_name = project_name or bind_root.name
+    session = OverleafSession(load_store(str(store_abs_path)))
+    project = session.get_project(resolved_project_name)
+    config = BridgeConfig(
+        version=BRIDGE_CONFIG_VERSION,
+        project_name=project["name"],
+        store_path=normalized_store_path,
+        sync_path=normalized_sync_path,
+        olignore=normalized_olignore,
+        git_remote=existing.git_remote if existing else "",
+        default_branch=existing.default_branch if existing else "",
+    )
+    write_bridge_config(bind_root, config)
+    session.persist(str(store_abs_path))
+    click.echo(f"Bound {bind_root} to Overleaf project '{config.project_name}'.")
+    click.echo(f"config: {config_path}")
+    click.echo(f"sync_path: {resolve_repo_path(bind_root, config.sync_path)}")
+
+
+@main.command(name="add")
+@click.option("-A", "--all", "add_all", is_flag=True, help="Stage all local files under the bound sync root.")
+@click.argument("paths", nargs=-1)
+def add(paths: tuple[str, ...], add_all: bool) -> None:
+    binding_root = find_bound_root()
+    config = load_bridge_config(binding_root)
+    session, project, store_path, sync_root, olignore_path = bridge_session_and_project(binding_root, config)
+    state = collect_sync_state(session, project, sync_root, olignore_path)
+    stage_entries = load_stage_entries(binding_root)
+
+    target_paths: set[str] = set()
+    if add_all:
+        target_paths.update(state["local_files"])
+    for value in paths:
+        target_paths.add(normalize_stage_path(sync_root, value))
+    if not target_paths:
+        raise click.ClickException("Nothing to stage. Provide path(s) or use `ovs add -A`.")
+
+    for rel_path in sorted(target_paths):
+        local_path = state["local_files"].get(rel_path)
+        remote_bytes = state["remote_zip"].get(rel_path)
+        if local_path is None and remote_bytes is None:
+            raise click.ClickException(f"Path not found locally or remotely: {rel_path}")
+        stage_entries[rel_path] = {
+            "local_hash": file_sha256(local_path.read_bytes()) if local_path is not None else None,
+            "remote_hash": file_sha256(remote_bytes) if remote_bytes is not None else None,
+        }
+        click.echo(f"staged {rel_path}")
+
+    save_stage_entries(binding_root, stage_entries)
+    session.persist(str(store_path))
+
+
+@main.command(name="reset")
+@click.option("--all", "reset_all", is_flag=True, help="Clear the current Overleaf stage.")
+@click.argument("paths", nargs=-1)
+def reset(paths: tuple[str, ...], reset_all: bool) -> None:
+    binding_root = find_bound_root()
+    stage_entries = load_stage_entries(binding_root)
+    if not stage_entries:
+        click.echo("No staged Overleaf paths.")
+        return
+    if reset_all:
+        save_stage_entries(binding_root, {})
+        click.echo("Cleared all staged Overleaf paths.")
+        return
+    if not paths:
+        raise click.ClickException("Provide path(s) to unstage, or use `ovs reset --all`.")
+
+    config = load_bridge_config(binding_root)
+    sync_root = resolve_repo_path(binding_root, config.sync_path)
+    removed = 0
+    for value in paths:
+        rel_path = normalize_stage_path(sync_root, value)
+        if rel_path in stage_entries:
+            stage_entries.pop(rel_path, None)
+            removed += 1
+            click.echo(f"unstaged {rel_path}")
+    save_stage_entries(binding_root, stage_entries)
+    if removed == 0:
+        raise click.ClickException("No matching staged Overleaf paths.")
+
+
+@main.command(name="push")
+@click.option("--dry-run", is_flag=True, help="Show the local->remote plan without applying it.")
+def push(dry_run: bool) -> None:
+    binding_root = find_bound_root()
+    config = load_bridge_config(binding_root)
+    session, project, store_path, sync_root, olignore_path = bridge_session_and_project(binding_root, config)
+    stage_entries = load_stage_entries(binding_root)
+    if stage_entries:
+        print_staged_entries(stage_entries)
+    if dry_run:
+        state = collect_sync_state(session, project, sync_root, olignore_path)
+        if stage_entries:
+            plan = {
+                "push_new": [path for path in sorted(stage_entries) if path in state["local_files"] and path not in state["remote_zip"]],
+                "push_replace": [path for path in sorted(stage_entries) if path in state["local_files"] and path in state["remote_zip"]],
+                "pull_new": [],
+                "pull_replace": [],
+                "local_delete": [],
+                "remote_delete": [path for path in sorted(stage_entries) if path not in state["local_files"] and path in state["remote_zip"]],
+                "remote_delete_folders": [],
+                "conflicts": [],
+            }
+        else:
+            plan = build_sync_plan(
+                state["local_files"],
+                state["remote_zip"],
+                state["remote_entities"],
+                state["remote_folders"],
+                True,
+                False,
+            )
+        print_sync_plan(plan)
+    elif stage_entries:
+        pushed = push_staged_entries(session, project, sync_root, olignore_path, stage_entries)
+        for rel_path in pushed:
+            stage_entries.pop(rel_path, None)
+        save_stage_entries(binding_root, stage_entries)
+    else:
+        sync_project(session, project, sync_root, olignore_path, local_only=True, remote_only=False)
+    session.persist(str(store_path))
+
+
+@main.command(name="pull")
+@click.option("--dry-run", is_flag=True, help="Show the remote->local plan without applying it.")
+def pull(dry_run: bool) -> None:
+    binding_root = find_bound_root()
+    config = load_bridge_config(binding_root)
+    session, project, store_path, sync_root, olignore_path = bridge_session_and_project(binding_root, config)
+    stage_entries = load_stage_entries(binding_root)
+    if stage_entries and not dry_run:
+        raise click.ClickException("Staged Overleaf paths exist. Push or reset them before pulling remote changes.")
+    if dry_run:
+        state = collect_sync_state(session, project, sync_root, olignore_path)
+        plan = build_sync_plan(
+            state["local_files"],
+            state["remote_zip"],
+            state["remote_entities"],
+            state["remote_folders"],
+            False,
+            True,
+        )
+        print_sync_plan(plan)
+    else:
+        sync_project(session, project, sync_root, olignore_path, local_only=False, remote_only=True)
     session.persist(str(store_path))
 
 
@@ -1705,7 +2093,7 @@ def repo() -> None:
 @click.option("-n", "--name", "project_name", default="", help="Overleaf project name. Defaults to the repository root name.")
 @click.option("--store-path", "store_path", default=None, show_default=AUTH_STORE_OPTION_DEFAULT, type=click.Path(exists=False), help=REPO_STORE_OPTION_HELP)
 @click.option("-p", "--path", "sync_path", default=".", show_default=True, type=click.Path(exists=False), help="Local sync path, relative to the repository root.")
-@click.option("-i", "--olignore", "olignore_path", default=DEFAULT_OLIGNORE, show_default=True, type=click.Path(exists=False), help="Path to .olignore, relative to the repository root.")
+@click.option("-i", "--ovsignore", "olignore_path", default=DEFAULT_OLIGNORE, show_default=True, type=click.Path(exists=False), help="Path to .ovsignore, relative to the repository root.")
 @click.option("--git-remote", "git_remote", default=DEFAULT_GIT_REMOTE, show_default=True, help="Git remote used for GitHub operations.")
 def repo_init(project_name: str, store_path: str | None, sync_path: str, olignore_path: str, git_remote: str) -> None:
     repo_root = find_repo_root()
@@ -1752,6 +2140,7 @@ def repo_init(project_name: str, store_path: str | None, sync_path: str, olignor
 def repo_status() -> None:
     repo_root = find_repo_root()
     config = load_bridge_config(repo_root)
+    require_repo_binding(config)
     git_status = collect_git_status(
         repo_root,
         config.git_remote,
@@ -1784,6 +2173,7 @@ def repo_status() -> None:
 def repo_push_github() -> None:
     repo_root = find_repo_root()
     config = load_bridge_config(repo_root)
+    require_repo_binding(config)
     git_status = collect_git_status(
         repo_root,
         config.git_remote,
@@ -1801,6 +2191,7 @@ def repo_push_github() -> None:
 def repo_pull_github() -> None:
     repo_root = find_repo_root()
     config = load_bridge_config(repo_root)
+    require_repo_binding(config)
     git_status = collect_git_status(
         repo_root,
         config.git_remote,
@@ -1818,6 +2209,7 @@ def repo_pull_github() -> None:
 def repo_push_overleaf() -> None:
     repo_root = find_repo_root()
     config = load_bridge_config(repo_root)
+    require_repo_binding(config)
     git_status = collect_git_status(
         repo_root,
         config.git_remote,
@@ -1834,6 +2226,7 @@ def repo_push_overleaf() -> None:
 def repo_pull_overleaf() -> None:
     repo_root = find_repo_root()
     config = load_bridge_config(repo_root)
+    require_repo_binding(config)
     git_status = collect_git_status(
         repo_root,
         config.git_remote,
@@ -1878,10 +2271,9 @@ def list_projects(cookie_path: str | None) -> None:
 @click.option("--download-path", "download_path", default=".", type=click.Path(exists=False), help="Where to write the compiled PDF.")
 @click.option("--store-path", "cookie_path", default=None, show_default=AUTH_STORE_OPTION_DEFAULT, type=click.Path(exists=False), help=AUTH_STORE_OPTION_HELP)
 def download_pdf(project_name: str, download_path: str, cookie_path: str | None) -> None:
-    store_path = resolve_auth_store_path(cookie_path)
+    resolved_project_name, store_path, _, _ = resolve_bound_project_context(project_name, cookie_path)
     session = OverleafSession(load_store(str(store_path)))
-    project_name = project_name or Path.cwd().name
-    project = session.get_project(project_name)
+    project = session.get_project(resolved_project_name)
     file_name, content = session.download_pdf(project["id"])
     output_root = Path(download_path).resolve()
     output_root.mkdir(parents=True, exist_ok=True)
@@ -1897,10 +2289,9 @@ def download_pdf(project_name: str, download_path: str, cookie_path: str | None)
 @click.option("--store-path", "cookie_path", default=None, show_default=AUTH_STORE_OPTION_DEFAULT, type=click.Path(exists=False), help=AUTH_STORE_OPTION_HELP)
 @click.option("--json", "json_output", is_flag=True, help="Print the remote file tree as JSON.")
 def tree(project_name: str, cookie_path: str | None, json_output: bool) -> None:
-    store_path = resolve_auth_store_path(cookie_path)
+    resolved_project_name, store_path, _, _ = resolve_bound_project_context(project_name, cookie_path)
     session = OverleafSession(load_store(str(store_path)))
-    project_name = project_name or Path.cwd().name
-    project = session.get_project(project_name)
+    project = session.get_project(resolved_project_name)
     remote_folders, remote_entities, root_folder_id = session.extract_tree(project["id"])
 
     if json_output:
@@ -1931,10 +2322,9 @@ def tree(project_name: str, cookie_path: str | None, json_output: bool) -> None:
 @click.option("--all", "download_all", is_flag=True, help="Download all compile artifacts.")
 @click.option("--json", "json_output", is_flag=True, help="Print the raw compile response as JSON.")
 def artifacts(project_name: str, cookie_path: str | None, download_path: str, artifact_paths: tuple[str, ...], download_all: bool, json_output: bool) -> None:
-    store_path = resolve_auth_store_path(cookie_path)
+    resolved_project_name, store_path, _, _ = resolve_bound_project_context(project_name, cookie_path)
     session = OverleafSession(load_store(str(store_path)))
-    project_name = project_name or Path.cwd().name
-    project = session.get_project(project_name)
+    project = session.get_project(resolved_project_name)
     payload = session.compile_project(project["id"])
 
     if json_output:
@@ -1960,16 +2350,19 @@ def artifacts(project_name: str, cookie_path: str | None, download_path: str, ar
 @click.option("-n", "--name", "project_name", default="", help="Overleaf project name.")
 @click.option("--store-path", "cookie_path", default=None, show_default=AUTH_STORE_OPTION_DEFAULT, type=click.Path(exists=False), help=AUTH_STORE_OPTION_HELP)
 @click.option("-p", "--path", "sync_path", default=".", type=click.Path(exists=True), help="Local sync path.")
-@click.option("-i", "--olignore", "olignore_path", default=".olignore", type=click.Path(exists=False), help="Path to .olignore relative to sync path.")
+@click.option("-i", "--ovsignore", "olignore_path", default=DEFAULT_OLIGNORE, type=click.Path(exists=False), help="Path to .ovsignore relative to sync path.")
 def status(local_only: bool, remote_only: bool, project_name: str, cookie_path: str | None, sync_path: str, olignore_path: str) -> None:
     if local_only and remote_only:
         raise click.ClickException("Use at most one of --local-only and --remote-only.")
-    sync_root = Path(sync_path).resolve()
-    store_path = resolve_auth_store_path(cookie_path, search_roots=[sync_root])
+    sync_root, resolved_project_name, store_path, resolved_olignore_path, binding_root, _ = resolve_bound_sync_context(
+        project_name,
+        cookie_path,
+        sync_path,
+        olignore_path,
+    )
     session = OverleafSession(load_store(str(store_path)))
-    project_name = project_name or sync_root.name
-    project = session.get_project(project_name)
-    state = collect_sync_state(session, project, sync_root, sync_root / olignore_path)
+    project = session.get_project(resolved_project_name)
+    state = collect_sync_state(session, project, sync_root, resolved_olignore_path)
     plan = build_sync_plan(
         state["local_files"],
         state["remote_zip"],
@@ -1978,6 +2371,8 @@ def status(local_only: bool, remote_only: bool, project_name: str, cookie_path: 
         local_only,
         remote_only,
     )
+    if binding_root is not None:
+        print_staged_entries(load_stage_entries(binding_root))
     print_sync_plan(plan)
     session.persist(str(store_path))
 

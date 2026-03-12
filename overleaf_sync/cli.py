@@ -42,6 +42,7 @@ DEFAULT_STORE_PATH = ".overleaf-sync-auth"
 DEFAULT_OLIGNORE = ".olignore"
 DEFAULT_REQUEST_TIMEOUT = (10, 30)
 DOWNLOAD_ZIP_TIMEOUT = (10, 60)
+LARGE_FILE_WARNING_BYTES = 10 * 1024 * 1024
 LOCAL_BRIDGE_METADATA_FILES = {
     BRIDGE_CONFIG_NAME,
     DEFAULT_STORE_PATH,
@@ -182,6 +183,16 @@ class GitStatusSummary:
     behind: int
 
 
+@dataclass
+class SyncProgressTracker:
+    total: int
+    current: int = 0
+
+    def step(self, label: str) -> str:
+        self.current += 1
+        return f"[{self.current}/{self.total} {label}]"
+
+
 class RemoteZipDownloadError(click.ClickException):
     """Raised when Overleaf's project archive cannot be downloaded reliably."""
 
@@ -198,6 +209,18 @@ def save_store(cookie_path: str, cookie: dict, csrf: str) -> None:
 
 def normalize_project_name(name: str) -> str:
     return re.sub(r"[\W_]+", "", name, flags=re.UNICODE).lower()
+
+
+def format_byte_size(size: int) -> str:
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    value = float(size)
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(value)} {unit}"
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{size} B"
 
 
 def run_git_command(args: list[str], cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -568,6 +591,52 @@ def collect_folder_paths(file_map: dict[str, object]) -> set[str]:
             folders.add(folder_path)
             folder_path = posixpath.dirname(folder_path)
     return folders
+
+
+def build_destructive_sync_warnings(plan: dict[str, list[str]], local_only: bool, remote_only: bool) -> list[str]:
+    warnings = []
+    if local_only:
+        remote_files = len(plan["remote_delete"])
+        remote_folders = len(plan["remote_delete_folders"])
+        if remote_files or remote_folders:
+            warnings.append(
+                "Local-only sync will delete "
+                f"{remote_files} remote file(s) and {remote_folders} remote folder(s) not present locally."
+            )
+    if remote_only:
+        local_files = len(plan["local_delete"])
+        if local_files:
+            warnings.append(f"Remote-only sync will delete {local_files} local file(s) not present remotely.")
+    return warnings
+
+
+def warn_for_large_upload(local_path: Path, rel_path: str) -> None:
+    size = local_path.stat().st_size
+    if size < LARGE_FILE_WARNING_BYTES:
+        return
+    click.echo(
+        f"[WARN] Large upload detected: {rel_path} ({format_byte_size(size)}). "
+        "Upload may take longer; progress is shown below as sync steps complete."
+    )
+
+
+def make_progress_tracker(plan: dict[str, list[str]], push_updates: list[str], pull_updates: list[str]) -> SyncProgressTracker | None:
+    total = (
+        len(plan["local_delete"])
+        + len(plan["remote_delete"])
+        + len(pull_updates)
+        + len(push_updates)
+        + len(plan["remote_delete_folders"])
+    )
+    if total == 0:
+        return None
+    return SyncProgressTracker(total=total)
+
+
+def progress_prefix(progress: SyncProgressTracker | None, label: str) -> str:
+    if progress is None:
+        return f"[{label}]"
+    return progress.step(label)
 
 
 class RealtimeProjectClient:
@@ -1307,19 +1376,42 @@ def sync_project_local_only_fallback(session: OverleafSession, project: dict, sy
     remote_entities = state["remote_entities"]
     root_folder_id = state["root_folder_id"]
     desired_folders = collect_folder_paths(local_files)
+    remote_delete_paths = [path for path in sorted(remote_entities) if path not in local_files]
+    remote_delete_folder_paths = [
+        folder_path
+        for folder_path in sorted(remote_folders, key=lambda item: item.count("/"), reverse=True)
+        if folder_path not in desired_folders
+    ]
+    progress_total = len(remote_delete_paths) + len(local_files) + len(remote_delete_folder_paths)
+    progress = SyncProgressTracker(total=progress_total) if progress_total else None
 
-    for path in sorted(remote_entities):
-        if path in local_files:
-            continue
+    for warning in build_destructive_sync_warnings(
+        {
+            "push_new": [],
+            "push_replace": [],
+            "pull_new": [],
+            "pull_replace": [],
+            "local_delete": [],
+            "remote_delete": remote_delete_paths,
+            "remote_delete_folders": remote_delete_folder_paths,
+            "conflicts": [],
+        },
+        True,
+        False,
+    ):
+        click.echo(f"[WARN] {warning}")
+
+    for path in remote_delete_paths:
         entity = remote_entities[path]
         session.delete_entity(project["id"], entity)
-        click.echo(f"[REMOTE DELETE] {path}")
+        click.echo(f"{progress_prefix(progress, 'REMOTE DELETE')} {path}")
 
     realtime = None
     try:
         for path in sorted(local_files):
             local_path = local_files[path]
             existing = remote_entities.get(path)
+            warn_for_large_upload(local_path, path)
 
             if existing is not None and existing["kind"] == "doc":
                 if realtime is None:
@@ -1327,7 +1419,7 @@ def sync_project_local_only_fallback(session: OverleafSession, project: dict, sy
                 try:
                     updated = realtime.update_doc(existing["id"], read_local_text(local_path))
                     if updated:
-                        click.echo(f"[LOCAL -> REMOTE OT] {path}")
+                        click.echo(f"{progress_prefix(progress, 'LOCAL -> REMOTE OT')} {path}")
                     continue
                 except (UnicodeDecodeError, click.ClickException) as exc:
                     click.echo(f"[OT FALLBACK] {path}: {exc}")
@@ -1344,16 +1436,14 @@ def sync_project_local_only_fallback(session: OverleafSession, project: dict, sy
                 "parent_folder_id": folder_id,
                 "name": local_path.name,
             }
-            click.echo(f"[LOCAL -> REMOTE] {path}")
+            click.echo(f"{progress_prefix(progress, 'LOCAL -> REMOTE')} {path}")
     finally:
         if realtime is not None:
             realtime.close()
 
-    for folder_path in sorted(remote_folders, key=lambda item: item.count("/"), reverse=True):
-        if folder_path in desired_folders:
-            continue
+    for folder_path in remote_delete_folder_paths:
         session.delete_entity(project["id"], remote_folders[folder_path])
-        click.echo(f"[REMOTE DELETE FOLDER] {folder_path}")
+        click.echo(f"{progress_prefix(progress, 'REMOTE DELETE FOLDER')} {folder_path}")
 
 
 def sync_project(session: OverleafSession, project: dict, sync_path: Path, olignore_path: Path, local_only: bool, remote_only: bool) -> None:
@@ -1381,26 +1471,32 @@ def sync_project(session: OverleafSession, project: dict, sync_path: Path, olign
         else:
             pull_updates.append(path)
 
+    for warning in build_destructive_sync_warnings(plan, local_only, remote_only):
+        click.echo(f"[WARN] {warning}")
+
+    progress = make_progress_tracker(plan, push_updates, pull_updates)
+
     for path in plan["local_delete"]:
         remove_local_file(sync_path / path)
-        click.echo(f"[LOCAL DELETE] {path}")
+        click.echo(f"{progress_prefix(progress, 'LOCAL DELETE')} {path}")
 
     for path in plan["remote_delete"]:
         entity = remote_entities.get(path)
         if entity:
             session.delete_entity(project["id"], entity)
             remote_entities.pop(path, None)
-            click.echo(f"[REMOTE DELETE] {path}")
+            click.echo(f"{progress_prefix(progress, 'REMOTE DELETE')} {path}")
 
     for path in pull_updates:
         write_local_file(sync_path / path, remote_zip[path])
-        click.echo(f"[REMOTE -> LOCAL] {path}")
+        click.echo(f"{progress_prefix(progress, 'REMOTE -> LOCAL')} {path}")
 
     realtime = None
     try:
         for path in push_updates:
             local_path = local_files[path]
             existing = remote_entities.get(path)
+            warn_for_large_upload(local_path, path)
 
             if existing is not None and existing["kind"] == "doc":
                 if realtime is None:
@@ -1408,7 +1504,7 @@ def sync_project(session: OverleafSession, project: dict, sync_path: Path, olign
                 try:
                     updated = realtime.update_doc(existing["id"], read_local_text(local_path))
                     if updated:
-                        click.echo(f"[LOCAL -> REMOTE OT] {path}")
+                        click.echo(f"{progress_prefix(progress, 'LOCAL -> REMOTE OT')} {path}")
                     continue
                 except (UnicodeDecodeError, click.ClickException) as exc:
                     click.echo(f"[OT FALLBACK] {path}: {exc}")
@@ -1425,14 +1521,14 @@ def sync_project(session: OverleafSession, project: dict, sync_path: Path, olign
                 "parent_folder_id": folder_id,
                 "name": local_path.name,
             }
-            click.echo(f"[LOCAL -> REMOTE] {path}")
+            click.echo(f"{progress_prefix(progress, 'LOCAL -> REMOTE')} {path}")
     finally:
         if realtime is not None:
             realtime.close()
 
     for folder_path in plan["remote_delete_folders"]:
         session.delete_entity(project["id"], remote_folders[folder_path])
-        click.echo(f"[REMOTE DELETE FOLDER] {folder_path}")
+        click.echo(f"{progress_prefix(progress, 'REMOTE DELETE FOLDER')} {folder_path}")
 
 
 def bridge_session_and_project(repo_root: Path, config: BridgeConfig) -> tuple[OverleafSession, dict, Path, Path, Path]:

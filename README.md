@@ -24,6 +24,7 @@ It focuses on three jobs:
 - exact folder sync between your working tree and Overleaf
 - access to compile outputs beyond `output.pdf`
 - a repo workflow where GitHub and Overleaf are driven from one local checkout
+- warnings before destructive sync actions and step-by-step progress during sync
 
 ## At a Glance
 
@@ -172,6 +173,8 @@ Most Overleaf scripts stop at "upload files". This one does not.
 - `repo push-github` and `repo pull-github` only run on the configured default branch and require a clean working tree.
 - `repo push-overleaf` also stays on the configured default branch, but it syncs the current working tree and allows uncommitted changes.
 - `repo pull-overleaf` requires a clean working tree before applying remote changes locally.
+- local-only and remote-only syncs warn before deleting files on the target side.
+- large uploads are called out before transfer, and sync steps are shown as numbered progress output.
 - If Overleaf stalls while generating the project zip, `repo push-overleaf` falls back to the remote file tree so local-only pushes still complete.
 
 That difference is intentional:

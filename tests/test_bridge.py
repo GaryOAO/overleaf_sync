@@ -112,6 +112,26 @@ class BridgeHelpersTest(unittest.TestCase):
 
         self.assertEqual(request.call_args.kwargs["timeout"], cli.DOWNLOAD_ZIP_TIMEOUT)
 
+    def test_build_destructive_sync_warnings(self) -> None:
+        warnings = cli.build_destructive_sync_warnings(
+            {
+                "push_new": [],
+                "push_replace": [],
+                "pull_new": [],
+                "pull_replace": [],
+                "local_delete": [],
+                "remote_delete": ["a.tex", "b.tex"],
+                "remote_delete_folders": ["old"],
+                "conflicts": [],
+            },
+            local_only=True,
+            remote_only=False,
+        )
+        self.assertEqual(
+            warnings,
+            ["Local-only sync will delete 2 remote file(s) and 1 remote folder(s) not present locally."],
+        )
+
     def test_realtime_close_disconnects_even_if_socket_not_marked_connected(self) -> None:
         client = cli.RealtimeProjectClient(mock.Mock(), "project-1")
         socket = mock.Mock()
@@ -336,6 +356,43 @@ class BridgeCommandsTest(unittest.TestCase):
 
 
 class SyncFallbackTest(unittest.TestCase):
+    def test_sync_project_warns_and_shows_progress(self) -> None:
+        session = mock.Mock()
+        session.upload_file.return_value = {"success": True, "entity_type": "file", "entity_id": "file-1"}
+        project = {"id": "project-1"}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sync_root = Path(tmpdir)
+            local_path = sync_root / "big.bin"
+            local_path.write_bytes(b"0123456789")
+            olignore_path = sync_root / ".olignore"
+            olignore_path.write_text("", encoding="utf-8")
+
+            state = {
+                "local_files": {"big.bin": local_path},
+                "remote_zip": {"old.txt": b"remote\n"},
+                "remote_folders": {
+                    "old": {"kind": "folder", "id": "folder-1", "path": "old", "parent_folder_id": "root", "name": "old"}
+                },
+                "remote_entities": {
+                    "old.txt": {"kind": "file", "id": "doc-1", "path": "old.txt", "parent_folder_id": "root", "name": "old.txt"}
+                },
+                "root_folder_id": "root",
+                "remote_zip_available": True,
+            }
+
+            with mock.patch.object(cli, "collect_sync_state", return_value=state), mock.patch.object(
+                cli, "ensure_remote_folder", return_value="root"
+            ), mock.patch.object(cli, "LARGE_FILE_WARNING_BYTES", 4), mock.patch.object(cli.click, "echo") as echo:
+                cli.sync_project(session, project, sync_root, olignore_path, local_only=True, remote_only=False)
+
+        messages = [call.args[0] for call in echo.call_args_list]
+        self.assertIn("[WARN] Local-only sync will delete 1 remote file(s) and 1 remote folder(s) not present locally.", messages)
+        self.assertTrue(any("Large upload detected: big.bin" in message for message in messages))
+        self.assertIn("[1/3 REMOTE DELETE] old.txt", messages)
+        self.assertIn("[2/3 LOCAL -> REMOTE] big.bin", messages)
+        self.assertIn("[3/3 REMOTE DELETE FOLDER] old", messages)
+
     def test_sync_project_falls_back_for_local_only_push(self) -> None:
         session = mock.Mock()
         project = {"id": "project-1"}

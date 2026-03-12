@@ -5,6 +5,7 @@ from __future__ import annotations
 import difflib
 import fnmatch
 import io
+import json
 import mimetypes
 import os
 import pickle
@@ -553,23 +554,56 @@ class OverleafSession:
         return payload
 
     def download_pdf(self, project_id: str) -> tuple[str, bytes]:
-        response = self.session.post(
-            COMPILE_URL.format(project_id=project_id),
-            headers={"X-Csrf-Token": self.csrf},
-            json={
-                "check": "silent",
-                "draft": False,
-                "incrementalCompilesEnabled": True,
-                "rootDoc_id": "",
-                "stopOnFirstError": False,
-            },
-        )
-        response.raise_for_status()
-        payload = response.json()
+        payload = self.compile_project(project_id)
         pdf_file = next(output for output in payload["outputFiles"] if output["type"] == "pdf")
-        pdf_response = self.session.get(BASE_URL + pdf_file["url"], headers={"X-Csrf-Token": self.csrf})
-        pdf_response.raise_for_status()
-        return pdf_file["path"], pdf_response.content
+        return pdf_file["path"], self.download_output(pdf_file["url"])
+
+    def compile_project(
+        self,
+        project_id: str,
+        *,
+        root_doc_id: str = "",
+        draft: bool = False,
+        stop_on_first_error: bool = False,
+        max_attempts: int = 3,
+        retry_delay: float = 2.0,
+    ) -> dict:
+        payload = {}
+        for attempt in range(max_attempts):
+            response = self.session.post(
+                COMPILE_URL.format(project_id=project_id),
+                headers={"X-Csrf-Token": self.csrf},
+                json={
+                    "check": "silent",
+                    "draft": draft,
+                    "incrementalCompilesEnabled": True,
+                    "rootDoc_id": root_doc_id,
+                    "stopOnFirstError": stop_on_first_error,
+                },
+            )
+            response.raise_for_status()
+            payload = response.json()
+
+            status = payload.get("status")
+            output_files = payload.get("outputFiles") or []
+            should_retry = status in {"too-recently-compiled", "compile-in-progress"} and not output_files
+            if not should_retry or attempt == max_attempts - 1:
+                return payload
+            time.sleep(retry_delay)
+
+        return payload
+
+    def download_output(self, output_url: str) -> bytes:
+        if output_url.startswith("http://") or output_url.startswith("https://"):
+            url = output_url
+        elif output_url.startswith("/"):
+            url = BASE_URL + output_url
+        else:
+            url = f"{BASE_URL}/{output_url.lstrip('/')}"
+
+        response = self.session.get(url, headers={"X-Csrf-Token": self.csrf})
+        response.raise_for_status()
+        return response.content
 
     def extract_tree(self, project_id: str) -> tuple[dict[str, dict], dict[str, dict], str]:
         socket_response = self.session.get(f"{BASE_URL}/socket.io/1/", params={"projectId": project_id, "esh": 1, "ssp": 1, "t": 1})
@@ -778,6 +812,116 @@ def print_sync_plan(plan: dict[str, list[str]]) -> None:
     )
 
 
+def build_display_tree(remote_folders: dict[str, dict], remote_entities: dict[str, dict]) -> dict:
+    def new_node() -> dict:
+        return {"folders": {}, "files": []}
+
+    root = new_node()
+
+    def ensure_node(parts: list[str]) -> dict:
+        node = root
+        for part in parts:
+            node = node["folders"].setdefault(part, new_node())
+        return node
+
+    for folder_path in sorted(remote_folders):
+        ensure_node(folder_path.split("/"))
+
+    for rel_path, entity in sorted(remote_entities.items()):
+        parts = rel_path.split("/")
+        node = ensure_node(parts[:-1])
+        node["files"].append({"name": parts[-1], "kind": entity["kind"], "path": rel_path})
+
+    return root
+
+
+def render_tree_lines(node: dict, prefix: str = "") -> list[str]:
+    entries = [(name, "folder", child) for name, child in sorted(node["folders"].items())]
+    entries.extend((item["name"], item["kind"], item) for item in sorted(node["files"], key=lambda file_item: file_item["name"]))
+
+    lines = []
+    for index, (name, kind, payload) in enumerate(entries):
+        is_last = index == len(entries) - 1
+        connector = "└── " if is_last else "├── "
+        if kind == "folder":
+            lines.append(f"{prefix}{connector}{name}/")
+            lines.extend(render_tree_lines(payload, prefix + ("    " if is_last else "│   ")))
+            continue
+
+        label = "[doc]" if kind == "doc" else "[file]"
+        lines.append(f"{prefix}{connector}{name} {label}")
+
+    return lines
+
+
+def print_remote_tree(remote_folders: dict[str, dict], remote_entities: dict[str, dict]) -> None:
+    tree = build_display_tree(remote_folders, remote_entities)
+    lines = render_tree_lines(tree)
+    if not lines:
+        click.echo("(empty project)")
+        return
+    for line in lines:
+        click.echo(line)
+
+
+def sorted_output_files(payload: dict) -> list[dict]:
+    return sorted(
+        payload.get("outputFiles", []),
+        key=lambda item: (item.get("path", ""), item.get("type", ""), item.get("url", "")),
+    )
+
+
+def print_compile_outputs(payload: dict) -> None:
+    output_files = sorted_output_files(payload)
+    click.echo(f"Compile status: {payload.get('status', 'unknown')}")
+    click.echo(f"Artifacts: {len(output_files)}")
+
+    timings = payload.get("timings") or {}
+    if timings:
+        timing_parts = []
+        for key in ("compile", "compileE2E", "output", "sync"):
+            value = timings.get(key)
+            if value is not None:
+                timing_parts.append(f"{key}={value}")
+        if timing_parts:
+            click.echo("Timings: " + ", ".join(timing_parts))
+
+    for item in output_files:
+        click.echo(f"[ARTIFACT {item.get('type', 'unknown')}] {item.get('path', '')}")
+
+
+def select_output_files(payload: dict, artifact_paths: tuple[str, ...], download_all: bool) -> list[dict]:
+    output_files = sorted_output_files(payload)
+    if download_all:
+        return output_files
+
+    if not artifact_paths:
+        return []
+
+    by_path = {item.get("path", ""): item for item in output_files}
+    selected = []
+    missing = []
+    seen = set()
+    for artifact_path in artifact_paths:
+        item = by_path.get(artifact_path)
+        if item is None:
+            missing.append(artifact_path)
+            continue
+        if artifact_path not in seen:
+            selected.append(item)
+            seen.add(artifact_path)
+
+    if missing:
+        available = ", ".join(sorted(by_path)) or "(none)"
+        raise click.ClickException(
+            "Unknown compile artifact(s): "
+            + ", ".join(missing)
+            + f". Available artifacts: {available}"
+        )
+
+    return selected
+
+
 def sync_project(session: OverleafSession, project: dict, sync_path: Path, olignore_path: Path, local_only: bool, remote_only: bool) -> None:
     state = collect_sync_state(session, project, sync_path, olignore_path)
     local_files = state["local_files"]
@@ -916,7 +1060,7 @@ def list_projects(cookie_path: str) -> None:
 
 @main.command(name="download")
 @click.option("-n", "--name", "project_name", default="", help="Overleaf project name.")
-@click.option("--download-path", "download_path", default=".", type=click.Path(exists=True), help="Where to write the compiled PDF.")
+@click.option("--download-path", "download_path", default=".", type=click.Path(exists=False), help="Where to write the compiled PDF.")
 @click.option("--store-path", "cookie_path", default=".overleaf-sync-auth", show_default=True, type=click.Path(exists=False), help="Path to the persisted Overleaf auth store.")
 def download_pdf(project_name: str, download_path: str, cookie_path: str) -> None:
     if not os.path.isfile(cookie_path):
@@ -926,11 +1070,79 @@ def download_pdf(project_name: str, download_path: str, cookie_path: str) -> Non
     project_name = project_name or Path.cwd().name
     project = session.get_project(project_name)
     file_name, content = session.download_pdf(project["id"])
-    output_path = Path(download_path).resolve() / file_name
+    output_root = Path(download_path).resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+    output_path = output_root / file_name
     ensure_local_dir(output_path)
     output_path.write_bytes(content)
     session.persist(cookie_path)
     click.echo(f"Downloaded PDF to {output_path}")
+
+
+@main.command(name="tree")
+@click.option("-n", "--name", "project_name", default="", help="Overleaf project name.")
+@click.option("--store-path", "cookie_path", default=".overleaf-sync-auth", show_default=True, type=click.Path(exists=False), help="Path to the persisted Overleaf auth store.")
+@click.option("--json", "json_output", is_flag=True, help="Print the remote file tree as JSON.")
+def tree(project_name: str, cookie_path: str, json_output: bool) -> None:
+    if not os.path.isfile(cookie_path):
+        raise click.ClickException("Persisted Overleaf auth store not found. Run `overleaf-sync login` first.")
+
+    session = OverleafSession(load_store(cookie_path))
+    project_name = project_name or Path.cwd().name
+    project = session.get_project(project_name)
+    remote_folders, remote_entities, root_folder_id = session.extract_tree(project["id"])
+
+    if json_output:
+        click.echo(
+            json.dumps(
+                {
+                    "project": {"id": project["id"], "name": project.get("name", "")},
+                    "rootFolderId": root_folder_id,
+                    "folders": [remote_folders[path] for path in sorted(remote_folders)],
+                    "entities": [remote_entities[path] for path in sorted(remote_entities)],
+                },
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+        )
+    else:
+        print_remote_tree(remote_folders, remote_entities)
+
+    session.persist(cookie_path)
+
+
+@main.command(name="artifacts")
+@click.option("-n", "--name", "project_name", default="", help="Overleaf project name.")
+@click.option("--store-path", "cookie_path", default=".overleaf-sync-auth", show_default=True, type=click.Path(exists=False), help="Path to the persisted Overleaf auth store.")
+@click.option("--download-path", "download_path", default="output", type=click.Path(exists=False), help="Where to write downloaded compile artifacts.")
+@click.option("--artifact", "artifact_paths", multiple=True, help="Compile artifact path to download. Repeat the option to download multiple artifacts.")
+@click.option("--all", "download_all", is_flag=True, help="Download all compile artifacts.")
+@click.option("--json", "json_output", is_flag=True, help="Print the raw compile response as JSON.")
+def artifacts(project_name: str, cookie_path: str, download_path: str, artifact_paths: tuple[str, ...], download_all: bool, json_output: bool) -> None:
+    if not os.path.isfile(cookie_path):
+        raise click.ClickException("Persisted Overleaf auth store not found. Run `overleaf-sync login` first.")
+
+    session = OverleafSession(load_store(cookie_path))
+    project_name = project_name or Path.cwd().name
+    project = session.get_project(project_name)
+    payload = session.compile_project(project["id"])
+
+    if json_output:
+        click.echo(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        print_compile_outputs(payload)
+
+    selected = select_output_files(payload, artifact_paths, download_all)
+    output_root = Path(download_path).resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+    for item in selected:
+        output_path = output_root / item["path"]
+        ensure_local_dir(output_path)
+        output_path.write_bytes(session.download_output(item["url"]))
+        click.echo(f"Downloaded {item['path']} to {output_path}")
+
+    session.persist(cookie_path)
 
 
 @main.command(name="status")

@@ -10,6 +10,8 @@ It is built for people who want reproducible local editing, exact remote reconci
 - Pulls an Overleaf project back to the local folder.
 - Compares against the real remote file tree and the remote zip payload before applying changes.
 - Uses OT updates for text documents when possible and falls back to file upload when needed.
+- Prints the real remote Overleaf file tree.
+- Lists compile artifacts and downloads logs, aux files, or all outputs on demand.
 - Downloads the compiled PDF for a project.
 - Supports browser-based login and `.olignore` filtering.
 
@@ -25,8 +27,8 @@ Most lightweight Overleaf sync scripts stop at "upload files". Overleaf Sync goe
 ## Install
 
 ```bash
-git clone https://github.com/GaryOAO/overleaf_sync.git
-cd overleaf_sync
+git clone https://github.com/GaryOAO/overleaf-sync.git
+cd overleaf-sync
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .
@@ -50,6 +52,18 @@ overleaf-sync -l --name "My Overleaf Project" --store-path .overleaf-sync-auth
 
 # Pull remote files to local
 overleaf-sync -r --name "My Overleaf Project" --store-path .overleaf-sync-auth
+
+# Show the real remote file tree
+overleaf-sync tree --name "My Overleaf Project" --store-path .overleaf-sync-auth
+
+# List compile artifacts
+overleaf-sync artifacts --name "My Overleaf Project" --store-path .overleaf-sync-auth
+
+# Download selected compile artifacts
+overleaf-sync artifacts --name "My Overleaf Project" --store-path .overleaf-sync-auth --artifact output.log --artifact output.stderr
+
+# Download all compile artifacts
+overleaf-sync artifacts --name "My Overleaf Project" --store-path .overleaf-sync-auth --all --download-path output
 
 # Download compiled PDF
 overleaf-sync download --name "My Overleaf Project" --store-path .overleaf-sync-auth --download-path output
@@ -83,6 +97,7 @@ Do not commit these files:
 - `.olauth`
 - `.olignore` if it contains project-specific private paths
 - downloaded PDFs or private project source trees
+- compile logs or artifacts if they contain private project contents
 
 This repository intentionally does not include any Overleaf auth store, cookies, private project data, or local export artifacts.
 

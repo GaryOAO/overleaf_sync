@@ -12,8 +12,10 @@ import pickle
 import posixpath
 import re
 import ssl
+import subprocess
 import time
 import zipfile
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import click
@@ -33,6 +35,16 @@ DELETE_FILE_URL = f"{BASE_URL}/project/{{project_id}}/file/{{entity_id}}"
 DELETE_FOLDER_URL = f"{BASE_URL}/project/{{project_id}}/folder/{{entity_id}}"
 UPLOAD_URL = f"{BASE_URL}/project/{{project_id}}/upload"
 COMPILE_URL = f"{BASE_URL}/project/{{project_id}}/compile?enable_pdf_caching=true"
+BRIDGE_CONFIG_NAME = ".overleaf-sync.json"
+BRIDGE_CONFIG_VERSION = 1
+DEFAULT_GIT_REMOTE = "origin"
+DEFAULT_STORE_PATH = ".overleaf-sync-auth"
+DEFAULT_OLIGNORE = ".olignore"
+LOCAL_BRIDGE_METADATA_FILES = {
+    BRIDGE_CONFIG_NAME,
+    DEFAULT_STORE_PATH,
+    ".olauth",
+}
 TREE_JS = r"""
 () => {
   const treeRoot = document.querySelector('[role="tree"]');
@@ -145,6 +157,29 @@ TREE_JS = r"""
 """
 
 
+@dataclass(frozen=True)
+class BridgeConfig:
+    version: int
+    project_name: str
+    store_path: str
+    sync_path: str
+    olignore: str
+    git_remote: str
+    default_branch: str
+
+
+@dataclass(frozen=True)
+class GitStatusSummary:
+    repo_root: Path
+    git_remote: str
+    remote_url: str
+    current_branch: str
+    default_branch: str
+    is_clean: bool
+    ahead: int
+    behind: int
+
+
 def load_store(cookie_path: str) -> dict:
     with open(cookie_path, "rb") as handle:
         return pickle.load(handle)
@@ -157,6 +192,232 @@ def save_store(cookie_path: str, cookie: dict, csrf: str) -> None:
 
 def normalize_project_name(name: str) -> str:
     return re.sub(r"[\W_]+", "", name, flags=re.UNICODE).lower()
+
+
+def run_git_command(args: list[str], cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=str(cwd) if cwd is not None else None,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if check and result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip() or f"git {' '.join(args)} failed."
+        raise click.ClickException(message)
+    return result
+
+
+def find_repo_root(start_path: Path | None = None) -> Path:
+    cwd = (start_path or Path.cwd()).resolve()
+    try:
+        result = run_git_command(["rev-parse", "--show-toplevel"], cwd=cwd)
+    except click.ClickException as exc:
+        raise click.ClickException("Not inside a Git repository.") from exc
+    return Path(result.stdout.strip()).resolve()
+
+
+def bridge_config_path(repo_root: Path) -> Path:
+    return repo_root / BRIDGE_CONFIG_NAME
+
+
+def parse_git_status_porcelain(output: str) -> dict[str, object]:
+    lines = output.splitlines()
+    header = lines[0] if lines else ""
+    entries = lines[1:]
+    branch = ""
+    upstream = ""
+    ahead = 0
+    behind = 0
+
+    if header.startswith("## "):
+        branch_info = header[3:]
+        branch_text, _, divergence = branch_info.partition(" [")
+        branch_name, _, upstream_name = branch_text.partition("...")
+        branch = branch_name.strip()
+        upstream = upstream_name.strip()
+
+        if divergence:
+            divergence = divergence.rstrip("]")
+            for item in divergence.split(","):
+                item = item.strip()
+                if item.startswith("ahead "):
+                    ahead = int(item.split(" ", 1)[1])
+                elif item.startswith("behind "):
+                    behind = int(item.split(" ", 1)[1])
+
+    return {
+        "branch": branch,
+        "upstream": upstream,
+        "ahead": ahead,
+        "behind": behind,
+        "entries": entries,
+        "is_clean": not has_meaningful_git_changes(entries),
+    }
+
+
+def status_entry_path(entry: str) -> str:
+    path = entry[3:].strip() if len(entry) > 3 else ""
+    if " -> " in path:
+        return path.split(" -> ", 1)[1].strip()
+    return path
+
+
+def has_meaningful_git_changes(entries: list[str], ignored_untracked_paths: set[str] | None = None) -> bool:
+    ignored = LOCAL_BRIDGE_METADATA_FILES | (ignored_untracked_paths or set())
+    for entry in entries:
+        code = entry[:2]
+        path = status_entry_path(entry)
+        if code == "??" and path in ignored:
+            continue
+        return True
+    return False
+
+
+def normalize_bridge_path(value: str, field_name: str) -> str:
+    path = Path(value)
+    if path.is_absolute():
+        raise click.ClickException(f"{field_name} must be relative to the repository root.")
+    return path.as_posix() or "."
+
+
+def resolve_repo_path(repo_root: Path, value: str) -> Path:
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    return (repo_root / path).resolve()
+
+
+def load_bridge_config(repo_root: Path) -> BridgeConfig:
+    config_path = bridge_config_path(repo_root)
+    if not config_path.is_file():
+        raise click.ClickException(f"Bridge config not found at {config_path}. Run `overleaf-sync bridge init` first.")
+
+    try:
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise click.ClickException(f"Failed to read bridge config at {config_path}: {exc}") from exc
+
+    required_fields = {
+        "version",
+        "project_name",
+        "store_path",
+        "sync_path",
+        "olignore",
+        "git_remote",
+        "default_branch",
+    }
+    missing_fields = sorted(required_fields - set(data))
+    if missing_fields:
+        raise click.ClickException(f"Bridge config is missing required field(s): {', '.join(missing_fields)}")
+    if data["version"] != BRIDGE_CONFIG_VERSION:
+        raise click.ClickException(
+            f"Unsupported bridge config version {data['version']}. Expected {BRIDGE_CONFIG_VERSION}."
+        )
+
+    return BridgeConfig(
+        version=int(data["version"]),
+        project_name=str(data["project_name"]),
+        store_path=str(data["store_path"]),
+        sync_path=str(data["sync_path"]),
+        olignore=str(data["olignore"]),
+        git_remote=str(data["git_remote"]),
+        default_branch=str(data["default_branch"]),
+    )
+
+
+def write_bridge_config(repo_root: Path, config: BridgeConfig) -> Path:
+    config_path = bridge_config_path(repo_root)
+    config_path.write_text(json.dumps(asdict(config), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return config_path
+
+
+def git_remote_url(repo_root: Path, git_remote: str) -> str:
+    result = run_git_command(["remote", "get-url", git_remote], cwd=repo_root)
+    return result.stdout.strip()
+
+
+def detect_default_branch(repo_root: Path, git_remote: str) -> str:
+    symbolic_ref = run_git_command(
+        ["symbolic-ref", f"refs/remotes/{git_remote}/HEAD"],
+        cwd=repo_root,
+        check=False,
+    )
+    if symbolic_ref.returncode == 0:
+        return symbolic_ref.stdout.strip().rsplit("/", 1)[-1]
+
+    current_branch = run_git_command(["branch", "--show-current"], cwd=repo_root).stdout.strip()
+    if current_branch in {"main", "master"}:
+        return current_branch
+
+    main_ref = run_git_command(
+        ["rev-list", "--left-right", "--count", f"{git_remote}/main...HEAD"],
+        cwd=repo_root,
+        check=False,
+    )
+    if main_ref.returncode == 0:
+        return "main"
+
+    master_ref = run_git_command(
+        ["rev-list", "--left-right", "--count", f"{git_remote}/master...HEAD"],
+        cwd=repo_root,
+        check=False,
+    )
+    if master_ref.returncode == 0:
+        return "master"
+
+    return "main"
+
+
+def collect_git_status(
+    repo_root: Path,
+    git_remote: str,
+    default_branch: str,
+    ignored_untracked_paths: set[str] | None = None,
+) -> GitStatusSummary:
+    remote_url = git_remote_url(repo_root, git_remote)
+    porcelain = parse_git_status_porcelain(
+        run_git_command(["status", "--porcelain=v1", "--branch"], cwd=repo_root).stdout
+    )
+    current_branch = run_git_command(["branch", "--show-current"], cwd=repo_root).stdout.strip()
+    if not current_branch:
+        current_branch = str(porcelain["branch"] or "HEAD")
+
+    ahead = int(porcelain["ahead"])
+    behind = int(porcelain["behind"])
+    rev_list = run_git_command(
+        ["rev-list", "--left-right", "--count", f"{git_remote}/{current_branch}...HEAD"],
+        cwd=repo_root,
+        check=False,
+    )
+    if rev_list.returncode == 0:
+        behind_str, ahead_str = rev_list.stdout.strip().split()
+        behind = int(behind_str)
+        ahead = int(ahead_str)
+
+    return GitStatusSummary(
+        repo_root=repo_root,
+        git_remote=git_remote,
+        remote_url=remote_url,
+        current_branch=current_branch,
+        default_branch=default_branch,
+        is_clean=not has_meaningful_git_changes(list(porcelain["entries"]), ignored_untracked_paths),
+        ahead=ahead,
+        behind=behind,
+    )
+
+
+def require_default_branch(git_status: GitStatusSummary) -> None:
+    if git_status.current_branch != git_status.default_branch:
+        raise click.ClickException(
+            f"Bridge commands only operate on the default branch '{git_status.default_branch}', "
+            f"but the current branch is '{git_status.current_branch}'."
+        )
+
+
+def require_clean_worktree(git_status: GitStatusSummary) -> None:
+    if not git_status.is_clean:
+        raise click.ClickException("Working tree must be clean for this bridge command.")
 
 
 def ignore_patterns(olignore_path: Path) -> list[str]:
@@ -812,6 +1073,46 @@ def print_sync_plan(plan: dict[str, list[str]]) -> None:
     )
 
 
+def summarize_sync_plan(plan: dict[str, list[str]]) -> dict[str, int]:
+    return {key: len(values) for key, values in plan.items() if values}
+
+
+def format_sync_plan_summary(plan: dict[str, list[str]]) -> str:
+    counts = summarize_sync_plan(plan)
+    if not counts:
+        return "no actions"
+    return ", ".join(f"{key}={value}" for key, value in counts.items())
+
+
+def print_bridge_status(
+    git_status: GitStatusSummary,
+    config: BridgeConfig,
+    push_plan: dict[str, list[str]],
+    pull_plan: dict[str, list[str]],
+    sync_root: Path,
+) -> None:
+    click.echo("Git:")
+    click.echo(f"  repo_root: {git_status.repo_root}")
+    click.echo(f"  remote: {git_status.git_remote} ({git_status.remote_url})")
+    click.echo(f"  current_branch: {git_status.current_branch}")
+    click.echo(f"  default_branch: {git_status.default_branch}")
+    click.echo(f"  working_tree: {'clean' if git_status.is_clean else 'dirty'}")
+    click.echo(f"  ahead: {git_status.ahead}")
+    click.echo(f"  behind: {git_status.behind}")
+    if git_status.current_branch != git_status.default_branch:
+        click.echo(
+            f"  warning: current branch '{git_status.current_branch}' is not the configured default branch "
+            f"'{git_status.default_branch}'; bridge push/pull commands only operate on the default branch."
+        )
+
+    click.echo("")
+    click.echo("Overleaf:")
+    click.echo(f"  project: {config.project_name}")
+    click.echo(f"  sync_path: {sync_root}")
+    click.echo(f"  push-overleaf: {format_sync_plan_summary(push_plan)}")
+    click.echo(f"  pull-overleaf: {format_sync_plan_summary(pull_plan)}")
+
+
 def build_display_tree(remote_folders: dict[str, dict], remote_entities: dict[str, dict]) -> dict:
     def new_node() -> dict:
         return {"folders": {}, "files": []}
@@ -995,6 +1296,21 @@ def sync_project(session: OverleafSession, project: dict, sync_path: Path, olign
         click.echo(f"[REMOTE DELETE FOLDER] {folder_path}")
 
 
+def bridge_session_and_project(repo_root: Path, config: BridgeConfig) -> tuple[OverleafSession, dict, Path, Path, Path]:
+    store_path = resolve_repo_path(repo_root, config.store_path)
+    if not store_path.is_file():
+        raise click.ClickException("Persisted Overleaf auth store not found. Run `overleaf-sync login` first.")
+
+    sync_root = resolve_repo_path(repo_root, config.sync_path)
+    if not sync_root.exists():
+        raise click.ClickException(f"Configured sync path does not exist: {sync_root}")
+
+    olignore_path = resolve_repo_path(repo_root, config.olignore)
+    session = OverleafSession(load_store(str(store_path)))
+    project = session.get_project(config.project_name)
+    return session, project, store_path, sync_root, olignore_path
+
+
 @click.group(invoke_without_command=True)
 @click.option("-l", "--local-only", "local_only", is_flag=True, help="Sync local files to Overleaf.")
 @click.option("-r", "--remote-only", "remote_only", is_flag=True, help="Sync remote files to local.")
@@ -1032,6 +1348,153 @@ def main(ctx: click.Context, local_only: bool, remote_only: bool, dry_run: bool,
         return
     sync_project(session, project, sync_root, sync_root / olignore_path, local_only, remote_only)
     session.persist(cookie_path)
+
+
+@main.group(name="bridge")
+def bridge() -> None:
+    """Bridge Git workflows and Overleaf sync for an existing repository."""
+
+
+@bridge.command(name="init")
+@click.option("-n", "--name", "project_name", default="", help="Overleaf project name. Defaults to the repository root name.")
+@click.option("--store-path", "store_path", default=DEFAULT_STORE_PATH, show_default=True, type=click.Path(exists=False), help="Path to the persisted Overleaf auth store, relative to the repository root.")
+@click.option("-p", "--path", "sync_path", default=".", show_default=True, type=click.Path(exists=False), help="Local sync path, relative to the repository root.")
+@click.option("-i", "--olignore", "olignore_path", default=DEFAULT_OLIGNORE, show_default=True, type=click.Path(exists=False), help="Path to .olignore, relative to the repository root.")
+@click.option("--git-remote", "git_remote", default=DEFAULT_GIT_REMOTE, show_default=True, help="Git remote used for GitHub operations.")
+def bridge_init(project_name: str, store_path: str, sync_path: str, olignore_path: str, git_remote: str) -> None:
+    repo_root = find_repo_root()
+    normalized_store_path = normalize_bridge_path(store_path, "store_path")
+    normalized_sync_path = normalize_bridge_path(sync_path, "sync_path")
+    normalized_olignore = normalize_bridge_path(olignore_path, "olignore")
+
+    git_remote_url(repo_root, git_remote)
+    store_abs_path = resolve_repo_path(repo_root, normalized_store_path)
+    if not store_abs_path.is_file():
+        raise click.ClickException("Persisted Overleaf auth store not found. Run `overleaf-sync login` first.")
+
+    sync_root = resolve_repo_path(repo_root, normalized_sync_path)
+    if not sync_root.exists():
+        raise click.ClickException(f"Configured sync path does not exist: {sync_root}")
+
+    resolved_project_name = project_name or repo_root.name
+    session = OverleafSession(load_store(str(store_abs_path)))
+    project = session.get_project(resolved_project_name)
+    default_branch = detect_default_branch(repo_root, git_remote)
+    config = BridgeConfig(
+        version=BRIDGE_CONFIG_VERSION,
+        project_name=project["name"],
+        store_path=normalized_store_path,
+        sync_path=normalized_sync_path,
+        olignore=normalized_olignore,
+        git_remote=git_remote,
+        default_branch=default_branch,
+    )
+    config_path = write_bridge_config(repo_root, config)
+    session.persist(str(store_abs_path))
+
+    click.echo(f"Wrote bridge config to {config_path}")
+    click.echo(f"project_name: {config.project_name}")
+    click.echo(f"git_remote: {config.git_remote}")
+    click.echo(f"default_branch: {config.default_branch}")
+
+
+@bridge.command(name="status")
+def bridge_status() -> None:
+    repo_root = find_repo_root()
+    config = load_bridge_config(repo_root)
+    git_status = collect_git_status(
+        repo_root,
+        config.git_remote,
+        config.default_branch,
+        ignored_untracked_paths={config.store_path, BRIDGE_CONFIG_NAME},
+    )
+    session, project, store_path, sync_root, olignore_path = bridge_session_and_project(repo_root, config)
+    state = collect_sync_state(session, project, sync_root, olignore_path)
+    push_plan = build_sync_plan(
+        state["local_files"],
+        state["remote_zip"],
+        state["remote_entities"],
+        state["remote_folders"],
+        True,
+        False,
+    )
+    pull_plan = build_sync_plan(
+        state["local_files"],
+        state["remote_zip"],
+        state["remote_entities"],
+        state["remote_folders"],
+        False,
+        True,
+    )
+    print_bridge_status(git_status, config, push_plan, pull_plan, sync_root)
+    session.persist(str(store_path))
+
+
+@bridge.command(name="push-github")
+def bridge_push_github() -> None:
+    repo_root = find_repo_root()
+    config = load_bridge_config(repo_root)
+    git_status = collect_git_status(
+        repo_root,
+        config.git_remote,
+        config.default_branch,
+        ignored_untracked_paths={config.store_path, BRIDGE_CONFIG_NAME},
+    )
+    require_default_branch(git_status)
+    require_clean_worktree(git_status)
+    result = run_git_command(["push", config.git_remote, git_status.current_branch], cwd=repo_root)
+    output = result.stdout.strip() or f"Pushed {git_status.current_branch} to {config.git_remote}."
+    click.echo(output)
+
+
+@bridge.command(name="pull-github")
+def bridge_pull_github() -> None:
+    repo_root = find_repo_root()
+    config = load_bridge_config(repo_root)
+    git_status = collect_git_status(
+        repo_root,
+        config.git_remote,
+        config.default_branch,
+        ignored_untracked_paths={config.store_path, BRIDGE_CONFIG_NAME},
+    )
+    require_default_branch(git_status)
+    require_clean_worktree(git_status)
+    result = run_git_command(["pull", "--ff-only", config.git_remote, git_status.current_branch], cwd=repo_root)
+    output = result.stdout.strip() or f"Pulled {git_status.current_branch} from {config.git_remote}."
+    click.echo(output)
+
+
+@bridge.command(name="push-overleaf")
+def bridge_push_overleaf() -> None:
+    repo_root = find_repo_root()
+    config = load_bridge_config(repo_root)
+    git_status = collect_git_status(
+        repo_root,
+        config.git_remote,
+        config.default_branch,
+        ignored_untracked_paths={config.store_path, BRIDGE_CONFIG_NAME},
+    )
+    require_default_branch(git_status)
+    session, project, store_path, sync_root, olignore_path = bridge_session_and_project(repo_root, config)
+    sync_project(session, project, sync_root, olignore_path, local_only=True, remote_only=False)
+    session.persist(str(store_path))
+
+
+@bridge.command(name="pull-overleaf")
+def bridge_pull_overleaf() -> None:
+    repo_root = find_repo_root()
+    config = load_bridge_config(repo_root)
+    git_status = collect_git_status(
+        repo_root,
+        config.git_remote,
+        config.default_branch,
+        ignored_untracked_paths={config.store_path, BRIDGE_CONFIG_NAME},
+    )
+    require_default_branch(git_status)
+    require_clean_worktree(git_status)
+    session, project, store_path, sync_root, olignore_path = bridge_session_and_project(repo_root, config)
+    sync_project(session, project, sync_root, olignore_path, local_only=False, remote_only=True)
+    session.persist(str(store_path))
 
 
 @main.command()

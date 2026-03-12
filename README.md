@@ -12,6 +12,7 @@ It is built for people who want reproducible local editing, exact remote reconci
 - Uses OT updates for text documents when possible and falls back to file upload when needed.
 - Prints the real remote Overleaf file tree.
 - Lists compile artifacts and downloads logs, aux files, or all outputs on demand.
+- Bridges an existing Git repository to GitHub and Overleaf with explicit commands.
 - Downloads the compiled PDF for a project.
 - Supports browser-based login and `.olignore` filtering.
 
@@ -67,6 +68,18 @@ overleaf-sync artifacts --name "My Overleaf Project" --store-path .overleaf-sync
 
 # Download compiled PDF
 overleaf-sync download --name "My Overleaf Project" --store-path .overleaf-sync-auth --download-path output
+
+# Initialize Git/Overleaf bridge config inside an existing Git repository
+overleaf-sync bridge init --name "My Overleaf Project"
+
+# Show Git + Overleaf bridge status
+overleaf-sync bridge status
+
+# Push committed changes to GitHub
+overleaf-sync bridge push-github
+
+# Push current working tree to Overleaf
+overleaf-sync bridge push-overleaf
 ```
 
 If `--name` is omitted, Overleaf Sync uses the current directory name.
@@ -89,6 +102,19 @@ output/*
 .olauth
 ```
 
+## Git Bridge
+
+The `bridge` command group is a repository orchestration layer, not Overleaf's official Git integration.
+
+- GitHub operations use your existing local Git repository, its configured `origin` remote, and your local Git credentials.
+- Overleaf operations still use the persisted auth store plus the existing sync engine in this tool.
+- `bridge init` writes a repository-local `.overleaf-sync.json` config in the Git repo root.
+- `bridge push-github` and `bridge pull-github` only run on the configured default branch and require a clean working tree.
+- `bridge push-overleaf` also only runs on the configured default branch, but it syncs the current working tree and allows uncommitted changes.
+- `bridge pull-overleaf` requires a clean working tree before writing remote changes locally.
+
+This intentionally differs from Git semantics on the Overleaf side: GitHub reflects committed history, while Overleaf can reflect your current working tree.
+
 ## Security
 
 Do not commit these files:
@@ -96,6 +122,7 @@ Do not commit these files:
 - `.overleaf-sync-auth`
 - `.olauth`
 - `.olignore` if it contains project-specific private paths
+- `.overleaf-sync.json` if your repository/project mapping is sensitive
 - downloaded PDFs or private project source trees
 - compile logs or artifacts if they contain private project contents
 

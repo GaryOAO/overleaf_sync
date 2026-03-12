@@ -70,39 +70,42 @@ You can use either command name:
 ### 1. Log in once
 
 ```bash
-ovs login --store-path .overleaf-sync-auth
-ovs list --store-path .overleaf-sync-auth
+ovs login
+ovs list
 ```
+
+By default, `ovs login` saves auth once to a global store and later commands reuse it automatically.
+If a local `.overleaf-sync-auth` or `.olauth` exists in the current sync folder, that local store is used first.
 
 ### 2. Sync a local folder with Overleaf
 
 ```bash
 # Push local files to Overleaf
-ovs -l --name "My Overleaf Project" --store-path .overleaf-sync-auth
+ovs -l --name "My Overleaf Project"
 
 # Pull remote files to local
-ovs -r --name "My Overleaf Project" --store-path .overleaf-sync-auth
+ovs -r --name "My Overleaf Project"
 
 # Show the plan without changing anything
-ovs --dry-run -l --name "My Overleaf Project" --store-path .overleaf-sync-auth
-ovs status -n "My Overleaf Project" --store-path .overleaf-sync-auth
+ovs --dry-run -l --name "My Overleaf Project"
+ovs status -n "My Overleaf Project"
 ```
 
 ### 3. Inspect remote state and compile results
 
 ```bash
 # Show the remote file tree
-ovs tree --name "My Overleaf Project" --store-path .overleaf-sync-auth
+ovs tree --name "My Overleaf Project"
 
 # List compile artifacts
-ovs artifacts --name "My Overleaf Project" --store-path .overleaf-sync-auth
+ovs artifacts --name "My Overleaf Project"
 
 # Download selected outputs
-ovs artifacts --name "My Overleaf Project" --store-path .overleaf-sync-auth \
+ovs artifacts --name "My Overleaf Project" \
   --artifact output.log --artifact output.stderr
 
 # Download the compiled PDF
-ovs download --name "My Overleaf Project" --store-path .overleaf-sync-auth --download-path output
+ovs download --name "My Overleaf Project" --download-path output
 ```
 
 ### 4. Add repo workflow on top
@@ -111,7 +114,7 @@ Inside an existing Git repository:
 
 ```bash
 # Create repo-level config
-ovs repo init --name "My Overleaf Project" --store-path .overleaf-sync-auth
+ovs repo init --name "My Overleaf Project"
 
 # Show Git + Overleaf side by side
 ovs repo status
@@ -214,6 +217,7 @@ Created by `ovs repo init` in the Git repo root. It stores:
 - default branch
 
 It is hidden, so it is not synced to Overleaf by the current sync rules.
+If you initialized the repo after a global `ovs login`, this auth path may point to the global store instead of a file inside the repository.
 
 ## Security
 

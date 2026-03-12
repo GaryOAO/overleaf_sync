@@ -1,7 +1,9 @@
 import json
 import os
 import subprocess
+import sys
 import tempfile
+import types
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
@@ -80,6 +82,9 @@ class DummySession:
     def get_project(self, project_name: str) -> dict:
         return {"id": "project-1", "name": project_name}
 
+    def list_projects(self) -> list[dict]:
+        return [{"lastUpdated": "2026-03-12", "name": "Demo Project"}]
+
     def persist(self, cookie_path: str) -> None:
         self.persisted_path = cookie_path
 
@@ -103,6 +108,30 @@ class BridgeHelpersTest(unittest.TestCase):
             self.assertEqual(loaded.project_name, "Bridge Demo")
             self.assertEqual(loaded.store_path, ".olauth")
             self.assertEqual(loaded.default_branch, "main")
+
+    def test_resolve_auth_store_path_prefers_local_before_global(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            local_store = root / ".overleaf-sync-auth"
+            global_store = root / "global" / "auth-store.pkl"
+            cli.save_store(str(local_store), {"sid": "local"}, "csrf-local")
+            cli.save_store(str(global_store), {"sid": "global"}, "csrf-global")
+
+            with working_directory(root), mock.patch.object(cli, "global_store_path", return_value=global_store):
+                resolved = cli.resolve_auth_store_path(None)
+
+            self.assertEqual(resolved, local_store.resolve())
+
+    def test_resolve_auth_store_path_uses_global_when_local_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            global_store = root / "global" / "auth-store.pkl"
+            cli.save_store(str(global_store), {"sid": "global"}, "csrf-global")
+
+            with working_directory(root), mock.patch.object(cli, "global_store_path", return_value=global_store):
+                resolved = cli.resolve_auth_store_path(None)
+
+            self.assertEqual(resolved, global_store.resolve())
 
     def test_download_zip_wraps_request_timeout(self) -> None:
         session = cli.OverleafSession({"cookie": {}, "csrf": "token"})
@@ -202,6 +231,54 @@ class BridgeCommandsTest(unittest.TestCase):
             self.assertEqual(config_data["project_name"], "Paper Project")
             self.assertEqual(config_data["git_remote"], "origin")
             self.assertEqual(config_data["default_branch"], "main")
+
+    def test_login_defaults_to_global_store(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            global_store = Path(tmpdir) / "global" / "auth-store.pkl"
+            fake_browser_login = types.SimpleNamespace(login=lambda: {"cookie": {"sid": "cookie"}, "csrf": "token"})
+            with mock.patch.object(cli, "global_store_path", return_value=global_store), mock.patch.dict(
+                sys.modules, {"overleaf_sync.browser_login": fake_browser_login}
+            ):
+                result = self.runner.invoke(cli.main, ["login"])
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertTrue(global_store.is_file())
+            store = cli.load_store(str(global_store))
+            self.assertEqual(store["cookie"], {"sid": "cookie"})
+            self.assertEqual(store["csrf"], "token")
+
+    def test_list_uses_global_store_without_explicit_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            global_store = root / "global" / "auth-store.pkl"
+            cli.save_store(str(global_store), {"sid": "cookie"}, "token")
+
+            with working_directory(root), mock.patch.object(cli, "global_store_path", return_value=global_store), mock.patch.object(
+                cli, "OverleafSession", DummySession
+            ):
+                result = self.runner.invoke(cli.main, ["list"])
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertEqual(DummySession.last_instance.persisted_path, str(global_store.resolve()))
+            self.assertIn("Demo Project", result.output)
+
+    def test_bridge_init_uses_global_store_when_no_local_auth_present(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_root = root / "repo"
+            global_store = root / "global" / "auth-store.pkl"
+            init_repo(repo_root)
+            git(["remote", "add", "origin", "https://example.com/demo.git"], cwd=repo_root)
+            cli.save_store(str(global_store), {"sid": "cookie"}, "token")
+
+            with working_directory(repo_root), mock.patch.object(cli, "global_store_path", return_value=global_store), mock.patch.object(
+                cli, "load_store", return_value={"cookie": {}, "csrf": "token"}
+            ), mock.patch.object(cli, "OverleafSession", DummySession):
+                result = self.runner.invoke(cli.main, ["repo", "init", "--name", "Paper Project"])
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            config_data = json.loads((repo_root / ".overleaf-sync.json").read_text(encoding="utf-8"))
+            self.assertEqual(config_data["store_path"], str(global_store.resolve()))
 
     def test_bridge_status_reports_git_and_overleaf_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

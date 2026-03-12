@@ -7,7 +7,6 @@ import fnmatch
 import io
 import json
 import mimetypes
-import os
 import pickle
 import posixpath
 import re
@@ -40,6 +39,11 @@ BRIDGE_CONFIG_VERSION = 1
 DEFAULT_GIT_REMOTE = "origin"
 DEFAULT_STORE_PATH = ".overleaf-sync-auth"
 DEFAULT_OLIGNORE = ".olignore"
+LEGACY_STORE_PATHS = (
+    DEFAULT_STORE_PATH,
+    ".olauth",
+)
+GLOBAL_STORE_FILENAME = "auth-store.pkl"
 DEFAULT_REQUEST_TIMEOUT = (10, 30)
 DOWNLOAD_ZIP_TIMEOUT = (10, 60)
 LARGE_FILE_WARNING_BYTES = 10 * 1024 * 1024
@@ -48,6 +52,19 @@ LOCAL_BRIDGE_METADATA_FILES = {
     DEFAULT_STORE_PATH,
     ".olauth",
 }
+AUTH_STORE_OPTION_DEFAULT = "local .overleaf-sync-auth/.olauth, else saved global auth"
+LOGIN_STORE_OPTION_DEFAULT = "saved global auth"
+AUTH_STORE_OPTION_HELP = (
+    "Path to the persisted Overleaf auth store. If omitted, uses local "
+    ".overleaf-sync-auth/.olauth when present, otherwise the saved global auth store."
+)
+LOGIN_STORE_OPTION_HELP = (
+    "Path to store the persisted Overleaf auth store. If omitted, saves to the global default auth store."
+)
+REPO_STORE_OPTION_HELP = (
+    "Path to the persisted Overleaf auth store. Relative paths are resolved from the repository root. "
+    "If omitted, repo init uses local .overleaf-sync-auth/.olauth when present, otherwise the saved global auth store."
+)
 TREE_JS = r"""
 () => {
   const treeRoot = document.querySelector('[role="tree"]');
@@ -198,13 +215,82 @@ class RemoteZipDownloadError(click.ClickException):
 
 
 def load_store(cookie_path: str) -> dict:
-    with open(cookie_path, "rb") as handle:
+    with Path(cookie_path).expanduser().open("rb") as handle:
         return pickle.load(handle)
 
 
 def save_store(cookie_path: str, cookie: dict, csrf: str) -> None:
-    with open(cookie_path, "wb") as handle:
+    path = Path(cookie_path).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as handle:
         pickle.dump({"cookie": cookie, "csrf": csrf}, handle)
+
+
+def global_store_path() -> Path:
+    return Path(click.get_app_dir("overleaf-sync")) / GLOBAL_STORE_FILENAME
+
+
+def resolve_cli_path(value: str, *, base_dir: Path | None = None) -> Path:
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return path.resolve()
+    return ((base_dir or Path.cwd()).resolve() / path).resolve()
+
+
+def auth_store_candidates(search_roots: list[Path] | None = None) -> list[Path]:
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+    roots: list[Path] = []
+    for root in search_roots or []:
+        resolved_root = root.resolve()
+        if resolved_root not in roots:
+            roots.append(resolved_root)
+
+    cwd = Path.cwd().resolve()
+    if cwd not in roots:
+        roots.append(cwd)
+
+    for root in roots:
+        for name in LEGACY_STORE_PATHS:
+            candidate = root / name
+            if candidate not in seen:
+                candidates.append(candidate)
+                seen.add(candidate)
+
+    global_path = global_store_path().resolve()
+    if global_path not in seen:
+        candidates.append(global_path)
+
+    return candidates
+
+
+def resolve_auth_store_path(
+    cookie_path: str | None,
+    *,
+    search_roots: list[Path] | None = None,
+    require_exists: bool = True,
+    base_dir: Path | None = None,
+) -> Path:
+    if cookie_path:
+        resolved = resolve_cli_path(cookie_path, base_dir=base_dir)
+        if require_exists and not resolved.is_file():
+            raise click.ClickException(
+                f"Persisted Overleaf auth store not found at {resolved}. Run `ovs login` first."
+            )
+        return resolved
+
+    candidates = auth_store_candidates(search_roots)
+    if not require_exists:
+        return global_store_path().resolve()
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+
+    raise click.ClickException(
+        "Persisted Overleaf auth store not found. Run `ovs login` first. "
+        f"Tried local .overleaf-sync-auth/.olauth and global {global_store_path().resolve()}."
+    )
 
 
 def normalize_project_name(name: str) -> str:
@@ -310,6 +396,13 @@ def normalize_bridge_path(value: str, field_name: str) -> str:
     return path.as_posix() or "."
 
 
+def normalize_store_config_path(value: str) -> str:
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return str(path.resolve())
+    return path.as_posix() or "."
+
+
 def resolve_repo_path(repo_root: Path, value: str) -> Path:
     path = Path(value)
     if path.is_absolute():
@@ -317,10 +410,30 @@ def resolve_repo_path(repo_root: Path, value: str) -> Path:
     return (repo_root / path).resolve()
 
 
+def display_store_config_path(repo_root: Path, store_path: Path) -> str:
+    try:
+        return store_path.resolve().relative_to(repo_root).as_posix()
+    except ValueError:
+        return str(store_path.resolve())
+
+
+def bridge_ignored_untracked_paths(repo_root: Path, config: BridgeConfig) -> set[str]:
+    ignored = {BRIDGE_CONFIG_NAME}
+    store_path = Path(config.store_path).expanduser()
+    if store_path.is_absolute():
+        try:
+            ignored.add(store_path.resolve().relative_to(repo_root).as_posix())
+        except ValueError:
+            pass
+    else:
+        ignored.add(store_path.as_posix())
+    return ignored
+
+
 def load_bridge_config(repo_root: Path) -> BridgeConfig:
     config_path = bridge_config_path(repo_root)
     if not config_path.is_file():
-        raise click.ClickException(f"Bridge config not found at {config_path}. Run `overleaf-sync bridge init` first.")
+        raise click.ClickException(f"Bridge config not found at {config_path}. Run `ovs repo init` first.")
 
     try:
         data = json.loads(config_path.read_text(encoding="utf-8"))
@@ -1534,7 +1647,7 @@ def sync_project(session: OverleafSession, project: dict, sync_path: Path, olign
 def bridge_session_and_project(repo_root: Path, config: BridgeConfig) -> tuple[OverleafSession, dict, Path, Path, Path]:
     store_path = resolve_repo_path(repo_root, config.store_path)
     if not store_path.is_file():
-        raise click.ClickException("Persisted Overleaf auth store not found. Run `overleaf-sync login` first.")
+        raise click.ClickException("Persisted Overleaf auth store not found. Run `ovs login` first.")
 
     sync_root = resolve_repo_path(repo_root, config.sync_path)
     if not sync_root.exists():
@@ -1551,21 +1664,19 @@ def bridge_session_and_project(repo_root: Path, config: BridgeConfig) -> tuple[O
 @click.option("-r", "--remote-only", "remote_only", is_flag=True, help="Sync remote files to local.")
 @click.option("--dry-run", "dry_run", is_flag=True, help="Show planned sync actions without applying them.")
 @click.option("-n", "--name", "project_name", default="", help="Overleaf project name.")
-@click.option("--store-path", "cookie_path", default=".overleaf-sync-auth", show_default=True, type=click.Path(exists=False), help="Path to the persisted Overleaf auth store.")
+@click.option("--store-path", "cookie_path", default=None, show_default=AUTH_STORE_OPTION_DEFAULT, type=click.Path(exists=False), help=AUTH_STORE_OPTION_HELP)
 @click.option("-p", "--path", "sync_path", default=".", type=click.Path(exists=True), help="Local sync path.")
 @click.option("-i", "--olignore", "olignore_path", default=".olignore", type=click.Path(exists=False), help="Path to .olignore relative to sync path.")
 @click.pass_context
-def main(ctx: click.Context, local_only: bool, remote_only: bool, dry_run: bool, project_name: str, cookie_path: str, sync_path: str, olignore_path: str) -> None:
+def main(ctx: click.Context, local_only: bool, remote_only: bool, dry_run: bool, project_name: str, cookie_path: str | None, sync_path: str, olignore_path: str) -> None:
     if ctx.invoked_subcommand is not None:
         return
 
     if local_only and remote_only:
         raise click.ClickException("Use at most one of --local-only and --remote-only.")
-    if not os.path.isfile(cookie_path):
-        raise click.ClickException("Persisted Overleaf auth store not found. Run `overleaf-sync login` first.")
-
-    session = OverleafSession(load_store(cookie_path))
     sync_root = Path(sync_path).resolve()
+    store_path = resolve_auth_store_path(cookie_path, search_roots=[sync_root])
+    session = OverleafSession(load_store(str(store_path)))
     project_name = project_name or sync_root.name
     project = session.get_project(project_name)
     if dry_run:
@@ -1579,10 +1690,10 @@ def main(ctx: click.Context, local_only: bool, remote_only: bool, dry_run: bool,
             remote_only,
         )
         print_sync_plan(plan)
-        session.persist(cookie_path)
+        session.persist(str(store_path))
         return
     sync_project(session, project, sync_root, sync_root / olignore_path, local_only, remote_only)
-    session.persist(cookie_path)
+    session.persist(str(store_path))
 
 
 @main.group(name="repo")
@@ -1592,20 +1703,24 @@ def repo() -> None:
 
 @repo.command(name="init")
 @click.option("-n", "--name", "project_name", default="", help="Overleaf project name. Defaults to the repository root name.")
-@click.option("--store-path", "store_path", default=DEFAULT_STORE_PATH, show_default=True, type=click.Path(exists=False), help="Path to the persisted Overleaf auth store, relative to the repository root.")
+@click.option("--store-path", "store_path", default=None, show_default=AUTH_STORE_OPTION_DEFAULT, type=click.Path(exists=False), help=REPO_STORE_OPTION_HELP)
 @click.option("-p", "--path", "sync_path", default=".", show_default=True, type=click.Path(exists=False), help="Local sync path, relative to the repository root.")
 @click.option("-i", "--olignore", "olignore_path", default=DEFAULT_OLIGNORE, show_default=True, type=click.Path(exists=False), help="Path to .olignore, relative to the repository root.")
 @click.option("--git-remote", "git_remote", default=DEFAULT_GIT_REMOTE, show_default=True, help="Git remote used for GitHub operations.")
-def repo_init(project_name: str, store_path: str, sync_path: str, olignore_path: str, git_remote: str) -> None:
+def repo_init(project_name: str, store_path: str | None, sync_path: str, olignore_path: str, git_remote: str) -> None:
     repo_root = find_repo_root()
-    normalized_store_path = normalize_bridge_path(store_path, "store_path")
     normalized_sync_path = normalize_bridge_path(sync_path, "sync_path")
     normalized_olignore = normalize_bridge_path(olignore_path, "olignore")
 
     git_remote_url(repo_root, git_remote)
-    store_abs_path = resolve_repo_path(repo_root, normalized_store_path)
-    if not store_abs_path.is_file():
-        raise click.ClickException("Persisted Overleaf auth store not found. Run `overleaf-sync login` first.")
+    if store_path:
+        normalized_store_path = normalize_store_config_path(store_path)
+        store_abs_path = resolve_repo_path(repo_root, normalized_store_path)
+        if not store_abs_path.is_file():
+            raise click.ClickException(f"Persisted Overleaf auth store not found at {store_abs_path}. Run `ovs login` first.")
+    else:
+        store_abs_path = resolve_auth_store_path(None, search_roots=[repo_root])
+        normalized_store_path = display_store_config_path(repo_root, store_abs_path)
 
     sync_root = resolve_repo_path(repo_root, normalized_sync_path)
     if not sync_root.exists():
@@ -1641,7 +1756,7 @@ def repo_status() -> None:
         repo_root,
         config.git_remote,
         config.default_branch,
-        ignored_untracked_paths={config.store_path, BRIDGE_CONFIG_NAME},
+        ignored_untracked_paths=bridge_ignored_untracked_paths(repo_root, config),
     )
     session, project, store_path, sync_root, olignore_path = bridge_session_and_project(repo_root, config)
     state = collect_sync_state(session, project, sync_root, olignore_path)
@@ -1673,7 +1788,7 @@ def repo_push_github() -> None:
         repo_root,
         config.git_remote,
         config.default_branch,
-        ignored_untracked_paths={config.store_path, BRIDGE_CONFIG_NAME},
+        ignored_untracked_paths=bridge_ignored_untracked_paths(repo_root, config),
     )
     require_default_branch(git_status)
     require_clean_worktree(git_status)
@@ -1690,7 +1805,7 @@ def repo_pull_github() -> None:
         repo_root,
         config.git_remote,
         config.default_branch,
-        ignored_untracked_paths={config.store_path, BRIDGE_CONFIG_NAME},
+        ignored_untracked_paths=bridge_ignored_untracked_paths(repo_root, config),
     )
     require_default_branch(git_status)
     require_clean_worktree(git_status)
@@ -1707,7 +1822,7 @@ def repo_push_overleaf() -> None:
         repo_root,
         config.git_remote,
         config.default_branch,
-        ignored_untracked_paths={config.store_path, BRIDGE_CONFIG_NAME},
+        ignored_untracked_paths=bridge_ignored_untracked_paths(repo_root, config),
     )
     require_default_branch(git_status)
     session, project, store_path, sync_root, olignore_path = bridge_session_and_project(repo_root, config)
@@ -1723,7 +1838,7 @@ def repo_pull_overleaf() -> None:
         repo_root,
         config.git_remote,
         config.default_branch,
-        ignored_untracked_paths={config.store_path, BRIDGE_CONFIG_NAME},
+        ignored_untracked_paths=bridge_ignored_untracked_paths(repo_root, config),
     )
     require_default_branch(git_status)
     require_clean_worktree(git_status)
@@ -1736,38 +1851,35 @@ main.add_command(repo, name="bridge")
 
 
 @main.command()
-@click.option("--store-path", "--path", "cookie_path", default=".overleaf-sync-auth", show_default=True, type=click.Path(exists=False), help="Path to store the persisted Overleaf auth store.")
-def login(cookie_path: str) -> None:
+@click.option("--store-path", "--path", "cookie_path", default=None, show_default=LOGIN_STORE_OPTION_DEFAULT, type=click.Path(exists=False), help=LOGIN_STORE_OPTION_HELP)
+def login(cookie_path: str | None) -> None:
     from overleaf_sync.browser_login import login as browser_login
 
     store = browser_login()
     if store is None:
         raise click.ClickException("Login failed.")
-    save_store(cookie_path, store["cookie"], store["csrf"])
-    click.echo(f"Login successful. Cookie persisted as `{click.format_filename(cookie_path)}`.")
+    store_path = resolve_auth_store_path(cookie_path, require_exists=False)
+    save_store(str(store_path), store["cookie"], store["csrf"])
+    click.echo(f"Login successful. Cookie persisted as `{click.format_filename(str(store_path))}`.")
 
 
 @main.command(name="list")
-@click.option("--store-path", "cookie_path", default=".overleaf-sync-auth", show_default=True, type=click.Path(exists=False), help="Path to the persisted Overleaf auth store.")
-def list_projects(cookie_path: str) -> None:
-    if not os.path.isfile(cookie_path):
-        raise click.ClickException("Persisted Overleaf auth store not found. Run `overleaf-sync login` first.")
-
-    session = OverleafSession(load_store(cookie_path))
+@click.option("--store-path", "cookie_path", default=None, show_default=AUTH_STORE_OPTION_DEFAULT, type=click.Path(exists=False), help=AUTH_STORE_OPTION_HELP)
+def list_projects(cookie_path: str | None) -> None:
+    store_path = resolve_auth_store_path(cookie_path)
+    session = OverleafSession(load_store(str(store_path)))
     for project in sorted(session.list_projects(), key=lambda item: item.get("lastUpdated", ""), reverse=True):
         click.echo(f"{project.get('lastUpdated', '')} - {project.get('name', '')}")
-    session.persist(cookie_path)
+    session.persist(str(store_path))
 
 
 @main.command(name="download")
 @click.option("-n", "--name", "project_name", default="", help="Overleaf project name.")
 @click.option("--download-path", "download_path", default=".", type=click.Path(exists=False), help="Where to write the compiled PDF.")
-@click.option("--store-path", "cookie_path", default=".overleaf-sync-auth", show_default=True, type=click.Path(exists=False), help="Path to the persisted Overleaf auth store.")
-def download_pdf(project_name: str, download_path: str, cookie_path: str) -> None:
-    if not os.path.isfile(cookie_path):
-        raise click.ClickException("Persisted Overleaf auth store not found. Run `overleaf-sync login` first.")
-
-    session = OverleafSession(load_store(cookie_path))
+@click.option("--store-path", "cookie_path", default=None, show_default=AUTH_STORE_OPTION_DEFAULT, type=click.Path(exists=False), help=AUTH_STORE_OPTION_HELP)
+def download_pdf(project_name: str, download_path: str, cookie_path: str | None) -> None:
+    store_path = resolve_auth_store_path(cookie_path)
+    session = OverleafSession(load_store(str(store_path)))
     project_name = project_name or Path.cwd().name
     project = session.get_project(project_name)
     file_name, content = session.download_pdf(project["id"])
@@ -1776,19 +1888,17 @@ def download_pdf(project_name: str, download_path: str, cookie_path: str) -> Non
     output_path = output_root / file_name
     ensure_local_dir(output_path)
     output_path.write_bytes(content)
-    session.persist(cookie_path)
+    session.persist(str(store_path))
     click.echo(f"Downloaded PDF to {output_path}")
 
 
 @main.command(name="tree")
 @click.option("-n", "--name", "project_name", default="", help="Overleaf project name.")
-@click.option("--store-path", "cookie_path", default=".overleaf-sync-auth", show_default=True, type=click.Path(exists=False), help="Path to the persisted Overleaf auth store.")
+@click.option("--store-path", "cookie_path", default=None, show_default=AUTH_STORE_OPTION_DEFAULT, type=click.Path(exists=False), help=AUTH_STORE_OPTION_HELP)
 @click.option("--json", "json_output", is_flag=True, help="Print the remote file tree as JSON.")
-def tree(project_name: str, cookie_path: str, json_output: bool) -> None:
-    if not os.path.isfile(cookie_path):
-        raise click.ClickException("Persisted Overleaf auth store not found. Run `overleaf-sync login` first.")
-
-    session = OverleafSession(load_store(cookie_path))
+def tree(project_name: str, cookie_path: str | None, json_output: bool) -> None:
+    store_path = resolve_auth_store_path(cookie_path)
+    session = OverleafSession(load_store(str(store_path)))
     project_name = project_name or Path.cwd().name
     project = session.get_project(project_name)
     remote_folders, remote_entities, root_folder_id = session.extract_tree(project["id"])
@@ -1810,21 +1920,19 @@ def tree(project_name: str, cookie_path: str, json_output: bool) -> None:
     else:
         print_remote_tree(remote_folders, remote_entities)
 
-    session.persist(cookie_path)
+    session.persist(str(store_path))
 
 
 @main.command(name="artifacts")
 @click.option("-n", "--name", "project_name", default="", help="Overleaf project name.")
-@click.option("--store-path", "cookie_path", default=".overleaf-sync-auth", show_default=True, type=click.Path(exists=False), help="Path to the persisted Overleaf auth store.")
+@click.option("--store-path", "cookie_path", default=None, show_default=AUTH_STORE_OPTION_DEFAULT, type=click.Path(exists=False), help=AUTH_STORE_OPTION_HELP)
 @click.option("--download-path", "download_path", default="output", type=click.Path(exists=False), help="Where to write downloaded compile artifacts.")
 @click.option("--artifact", "artifact_paths", multiple=True, help="Compile artifact path to download. Repeat the option to download multiple artifacts.")
 @click.option("--all", "download_all", is_flag=True, help="Download all compile artifacts.")
 @click.option("--json", "json_output", is_flag=True, help="Print the raw compile response as JSON.")
-def artifacts(project_name: str, cookie_path: str, download_path: str, artifact_paths: tuple[str, ...], download_all: bool, json_output: bool) -> None:
-    if not os.path.isfile(cookie_path):
-        raise click.ClickException("Persisted Overleaf auth store not found. Run `overleaf-sync login` first.")
-
-    session = OverleafSession(load_store(cookie_path))
+def artifacts(project_name: str, cookie_path: str | None, download_path: str, artifact_paths: tuple[str, ...], download_all: bool, json_output: bool) -> None:
+    store_path = resolve_auth_store_path(cookie_path)
+    session = OverleafSession(load_store(str(store_path)))
     project_name = project_name or Path.cwd().name
     project = session.get_project(project_name)
     payload = session.compile_project(project["id"])
@@ -1843,24 +1951,22 @@ def artifacts(project_name: str, cookie_path: str, download_path: str, artifact_
         output_path.write_bytes(session.download_output(item["url"]))
         click.echo(f"Downloaded {item['path']} to {output_path}")
 
-    session.persist(cookie_path)
+    session.persist(str(store_path))
 
 
 @main.command(name="status")
 @click.option("-l", "--local-only", "local_only", is_flag=True, help="Show the plan for local-only sync.")
 @click.option("-r", "--remote-only", "remote_only", is_flag=True, help="Show the plan for remote-only sync.")
 @click.option("-n", "--name", "project_name", default="", help="Overleaf project name.")
-@click.option("--store-path", "cookie_path", default=".overleaf-sync-auth", show_default=True, type=click.Path(exists=False), help="Path to the persisted Overleaf auth store.")
+@click.option("--store-path", "cookie_path", default=None, show_default=AUTH_STORE_OPTION_DEFAULT, type=click.Path(exists=False), help=AUTH_STORE_OPTION_HELP)
 @click.option("-p", "--path", "sync_path", default=".", type=click.Path(exists=True), help="Local sync path.")
 @click.option("-i", "--olignore", "olignore_path", default=".olignore", type=click.Path(exists=False), help="Path to .olignore relative to sync path.")
-def status(local_only: bool, remote_only: bool, project_name: str, cookie_path: str, sync_path: str, olignore_path: str) -> None:
+def status(local_only: bool, remote_only: bool, project_name: str, cookie_path: str | None, sync_path: str, olignore_path: str) -> None:
     if local_only and remote_only:
         raise click.ClickException("Use at most one of --local-only and --remote-only.")
-    if not os.path.isfile(cookie_path):
-        raise click.ClickException("Persisted Overleaf auth store not found. Run `overleaf-sync login` first.")
-
-    session = OverleafSession(load_store(cookie_path))
     sync_root = Path(sync_path).resolve()
+    store_path = resolve_auth_store_path(cookie_path, search_roots=[sync_root])
+    session = OverleafSession(load_store(str(store_path)))
     project_name = project_name or sync_root.name
     project = session.get_project(project_name)
     state = collect_sync_state(session, project, sync_root, sync_root / olignore_path)
@@ -1873,7 +1979,7 @@ def status(local_only: bool, remote_only: bool, project_name: str, cookie_path: 
         remote_only,
     )
     print_sync_plan(plan)
-    session.persist(cookie_path)
+    session.persist(str(store_path))
 
 
 if __name__ == "__main__":
